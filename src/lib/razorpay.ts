@@ -18,10 +18,15 @@ interface RazorpayOptions {
     email?: string;
     contact?: string;
   };
+  notes?: Record<string, string>;
   theme?: {
     color?: string;
+    backdrop_color?: string;
   };
   modal?: {
+    backdropclose?: boolean;
+    escape?: boolean;
+    handleback?: boolean;
     ondismiss?: () => void;
   };
 }
@@ -61,58 +66,30 @@ export const initiateRazorpayPayment = async (
   razorpay.open();
 };
 
-export const createRazorpayOrder = async (
-  amount: number,
-  currency: string,
-  planId: string,
-  userId: string
-) => {
+export const createRazorpayOrder = async (planId: string) => {
   const response = await fetch('/api/create-order', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      amount,
-      currency,
-      planId,
-      userId,
-    }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ planId }),
   });
 
-  if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(errorData.error || 'Failed to create order');
-  }
-
-  return response.json();
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Failed to create order');
+  return data;
 };
 
 export const verifyRazorpayPayment = async (
   razorpay_order_id: string,
   razorpay_payment_id: string,
   razorpay_signature: string,
-  planId: string,
-  userId: string
 ) => {
   const response = await fetch('/api/verify-payment', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      planId,
-      userId,
-    }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ razorpay_order_id, razorpay_payment_id, razorpay_signature }),
   });
 
-  if (!response.ok) {
-    const errorData = await response.json();
-    throw new Error(errorData.error || 'Payment verification failed');
-  }
-
-  return response.json();
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Payment verification failed');
+  return data;
 };

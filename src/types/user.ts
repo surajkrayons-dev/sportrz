@@ -4,7 +4,11 @@ export interface User {
   email: string | null;
   displayName: string | null;
   photoURL: string | null;
+  emailVerified?: boolean;
+  avatar?: string;
   isAdmin?: boolean;
+  accountRole?: 'user' | 'super_admin' | 'subadmin' | 'affiliate';
+  isAffiliate?: boolean;
   hasReceivedWelcomeNotification?: boolean;
 }
 

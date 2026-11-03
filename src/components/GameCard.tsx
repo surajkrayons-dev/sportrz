@@ -42,7 +42,7 @@ export default function GameCard({ game }: GameCardProps) {
     if (game.id === 'simulation10') return '/thumbnails/3.jpg';
   if (game.id === 'casual13') return '/thumbnails/6.jpg';
     
-    // For all other games, use the Firebase thumbnail
+    // For all other games, use the database thumbnail
     return game.thumbnail;
   };
 

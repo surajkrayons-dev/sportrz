@@ -7,7 +7,6 @@ import LoadingSpinner from '@/components/LoadingSpinner';
 import Sidebar from '@/components/Sidebar';
 import { GameInfo } from '@/types/game';
 import { useSearch } from '@/contexts/SearchContext';
-import { db } from '@/lib/firebase';
 import Slider from '@/components/Slider';
 import TopGameCard from '@/components/TopGameCard';
 
@@ -225,50 +224,28 @@ const getTopGames = (allGames: GameInfo[]): GameInfo[] => {
 
   const loadData = async () => {
     try {
-      // Import Firebase functions
-      const { collection, getDocs } = await import('firebase/firestore');
-      
-      // Fetch games from Firebase
-      const gamesSnapshot = await getDocs(collection(db, 'games'));
-// Replace this part in the loadData function
-const gamesList: GameInfo[] = [];
-gamesSnapshot.forEach((doc) => {
-  const data = doc.data();
-  
-  // Use the thumbnail URL from Firebase directly
-  gamesList.push({ 
-    id: data.id,
-    name: data.name,
-    categories: data.categories,
-    path: data.path,
-    thumbnail: data.thumbnail // Use the URL from Firebase
-  } as GameInfo);
-});
-      
-      // Sort games by numeric ID to maintain proper order
-      gamesList.sort((a, b) => {
-        const numA = extractNumericId(a.id);
-        const numB = extractNumericId(b.id);
-        return numA - numB;
-      });
-      
+      const [gamesResponse, categoriesResponse] = await Promise.all([
+        fetch('/api/games', { cache: 'no-store' }),
+        fetch('/api/categories', { cache: 'no-store' }),
+      ]);
+      if (!gamesResponse.ok) throw new Error('Unable to load games from MySQL API.');
+      if (!categoriesResponse.ok) throw new Error('Unable to load categories from MySQL API.');
+
+      const gamesList = await gamesResponse.json() as GameInfo[];
+      const categoriesList = await categoriesResponse.json() as string[];
+      gamesList.sort((a, b) => extractNumericId(a.id) - extractNumericId(b.id));
+
       setGames(gamesList);
       setTotalGames(gamesList.length);
-      
-      // Set top games
       setTopGames(getTopGames(gamesList));
-      
-      // Fetch categories from Firebase
-      const categoriesSnapshot = await getDocs(collection(db, 'categories'));
-      const categoriesList: string[] = [];
-      categoriesSnapshot.forEach((doc) => {
-        categoriesList.push(doc.data().name); // Assuming category documents have a 'name' field
-      });
-      
       setCategories(categoriesList);
       setFilteredGames(gamesList);
     } catch (error) {
       console.error('Error loading data:', error);
+      setGames([]);
+      setCategories([]);
+      setFilteredGames([]);
+      setTopGames([]);
     } finally {
       setLoading(false);
     }

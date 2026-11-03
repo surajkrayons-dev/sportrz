@@ -2,8 +2,6 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { db } from '@/lib/firebase';
-import { collection, getDocs } from 'firebase/firestore';
 import Sidebar from './Sidebar';
 
 export default function CategorySidebar({ activeCategory }: { activeCategory?: string }) {
@@ -13,11 +11,9 @@ export default function CategorySidebar({ activeCategory }: { activeCategory?: s
   useEffect(() => {
     const fetchCategories = async () => {
       try {
-        const categoriesList: string[] = [];
-        const categoriesSnapshot = await getDocs(collection(db, 'categories'));
-        categoriesSnapshot.forEach((doc) => {
-          categoriesList.push(doc.data().name);
-        });
+        const response = await fetch('/api/categories', { cache: 'no-store' });
+        if (!response.ok) throw new Error('Unable to load categories.');
+        const categoriesList = await response.json() as string[];
         setCategories(categoriesList);
       } catch (error) {
         console.error('Error loading categories:', error);

@@ -23,10 +23,10 @@ export default function SubscriptionGuard({
 
   useEffect(() => {
     // Show warning if subscription expires in 7 days or less
-    if (isSubscribed && daysRemaining <= 7 && daysRemaining > 0) {
+    if (isSubscribed && subscriptionData?.endDate && daysRemaining <= 7 && daysRemaining > 0) {
       setShowWarning(true);
     }
-  }, [isSubscribed, daysRemaining]);
+  }, [isSubscribed, daysRemaining, subscriptionData?.endDate]);
 
   // If premium is required but user doesn't have valid subscription
   if (requiresPremium && (!isSubscribed || isExpired)) {

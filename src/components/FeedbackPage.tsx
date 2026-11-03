@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import { StarIcon } from '@heroicons/react/24/solid';
 import { StarIcon as StarOutlineIcon } from '@heroicons/react/24/outline';
-import { reviewService } from '@/lib/firebaseService';
+import { reviewService } from '@/lib/gameService';
 
 interface Review {
   id: string;

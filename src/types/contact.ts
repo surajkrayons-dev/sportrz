@@ -6,7 +6,7 @@ export interface ContactMessage {
   subject: string;
   message: string;
   status: 'read' | 'unread';
-  createdAt: any; // Firestore timestamp
+  createdAt: Date | string;
   timestamp: string;
   userAgent?: string;
 }

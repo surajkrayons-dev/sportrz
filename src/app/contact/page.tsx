@@ -2,8 +2,6 @@
 'use client';
 
 import { useState } from 'react';
-import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
-import { db } from '@/lib/firebase';
 import { useToast } from '@/contexts/ToastContext';
 
 export default function ContactPage() {
@@ -29,14 +27,13 @@ export default function ContactPage() {
     setIsSubmitting(true);
     
     try {
-      // Save to Firestore
-      await addDoc(collection(db, 'contactMessages'), {
-        ...formData,
-        createdAt: serverTimestamp(),
-        status: 'unread',
-        userAgent: navigator.userAgent,
-        timestamp: new Date().toISOString()
+      const response = await fetch('/api/contact', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData),
       });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Unable to send your message.');
 
       setIsSubmitting(false);
       setSubmitSuccess(true);

@@ -1,12 +1,12 @@
-// src/contexts/SubscriptionContext.tsx
 'use client';
 
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import { useAuth } from './AuthContext';
 
 interface SubscriptionData {
   plan: string;
   startDate: string;
-  endDate: string;
+  endDate: string | null;
   paymentId?: string;
   orderId?: string;
   isActive: boolean;
@@ -19,146 +19,86 @@ interface SubscriptionContextType {
   subscriptionData: SubscriptionData | null;
   isExpired: boolean;
   daysRemaining: number;
-  setSubscription: (plan: string, paymentData?: any, isAnnual?: boolean) => void;
+  setSubscription: (plan: string, paymentData?: any, isAnnual?: boolean) => Promise<void>;
   clearSubscription: () => void;
   checkSubscriptionValidity: () => boolean;
+  refreshSubscription: () => Promise<void>;
 }
 
 const SubscriptionContext = createContext<SubscriptionContextType | undefined>(undefined);
 
 export function SubscriptionProvider({ children }: { children: ReactNode }) {
+  const { currentUser } = useAuth();
   const [isSubscribed, setIsSubscribed] = useState(false);
   const [subscriptionPlan, setSubscriptionPlan] = useState<string | null>(null);
   const [subscriptionData, setSubscriptionData] = useState<SubscriptionData | null>(null);
   const [isExpired, setIsExpired] = useState(false);
   const [daysRemaining, setDaysRemaining] = useState(0);
 
-  // Check subscription validity
-  const checkSubscriptionValidity = (): boolean => {
-    if (!subscriptionData) return false;
-    
-    const now = new Date();
-    const endDate = new Date(subscriptionData.endDate);
-    
-    const isValid = now < endDate && subscriptionData.isActive;
-    const remaining = Math.max(0, Math.ceil((endDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
-    
-    setIsExpired(!isValid);
-    setDaysRemaining(remaining);
-    
-    if (!isValid && subscriptionData.isActive) {
-      // Subscription has expired, deactivate it
-      const expiredData = { ...subscriptionData, isActive: false };
-      setSubscriptionData(expiredData);
+  const applySubscription = useCallback((data: SubscriptionData | null) => {
+    if (!data) {
+      setSubscriptionData(null);
+      setSubscriptionPlan(null);
       setIsSubscribed(false);
-      
-      // Update localStorage
-      const savedData = {
-        ...expiredData,
-        timestamp: Date.now(),
-        checksum: btoa(expiredData.plan + expiredData.endDate + 'sportrz_sub_security')
-      };
-      localStorage.setItem('sportrz_subscription', JSON.stringify(savedData));
+      setIsExpired(false);
+      setDaysRemaining(0);
+      return;
     }
-    
-    return isValid;
-  };
-
-  // Load subscription state from localStorage on mount
-  useEffect(() => {
-    const savedSubscription = localStorage.getItem('sportrz_subscription');
-    if (savedSubscription) {
-      try {
-        const data = JSON.parse(savedSubscription);
-        
-        // Verify checksum to prevent tampering
-        const expectedChecksum = btoa(data.plan + data.endDate + 'sportrz_sub_security');
-        if (data.checksum !== expectedChecksum) {
-          localStorage.removeItem('sportrz_subscription');
-          return;
-        }
-        
-        setSubscriptionData(data);
-        setSubscriptionPlan(data.plan);
-        
-        // Check if subscription is still valid
-        const now = new Date();
-        const endDate = new Date(data.endDate);
-        const isValid = now < endDate && data.isActive;
-        
-        setIsSubscribed(isValid);
-        setIsExpired(!isValid);
-        setDaysRemaining(Math.max(0, Math.ceil((endDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))));
-        
-      } catch (error) {
-        console.error('Error loading subscription data:', error);
-        localStorage.removeItem('sportrz_subscription');
-      }
-    }
+    const endDate = data.endDate ? new Date(data.endDate) : null;
+    const valid = data.isActive && (!endDate || (Number.isFinite(endDate.getTime()) && endDate.getTime() > Date.now()));
+    const daysLeft = valid && endDate ? Math.max(0, Math.ceil((endDate.getTime() - Date.now()) / 86400000)) : 0;
+    setSubscriptionData({ ...data, isActive: valid });
+    setSubscriptionPlan(data.plan);
+    setIsSubscribed(valid);
+    setIsExpired(!valid);
+    setDaysRemaining(daysLeft);
   }, []);
 
-  // Check subscription validity every minute
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (subscriptionData) {
-        checkSubscriptionValidity();
-      }
-    }, 60000); // Check every minute
+  const refreshSubscription = useCallback(async () => {
+    if (!currentUser) {
+      applySubscription(null);
+      return;
+    }
+    try {
+      const response = await fetch('/api/subscription', { cache: 'no-store' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Unable to refresh subscription.');
+      applySubscription(data.subscription || null);
+    } catch (error) {
+      console.error('Unable to refresh subscription status:', error);
+      // Fail closed: premium status should never be inferred from client-side storage.
+      applySubscription(null);
+    }
+  }, [currentUser, applySubscription]);
 
+  useEffect(() => { void refreshSubscription(); }, [refreshSubscription]);
+
+  const checkSubscriptionValidity = useCallback((): boolean => {
+    if (!subscriptionData) return false;
+    const end = subscriptionData.endDate ? new Date(subscriptionData.endDate).getTime() : null;
+    const valid = subscriptionData.isActive && (end === null || (Number.isFinite(end) && end > Date.now()));
+    setIsSubscribed(valid);
+    setIsExpired(!valid);
+    setDaysRemaining(valid && end !== null ? Math.max(0, Math.ceil((end - Date.now()) / 86400000)) : 0);
+    if (!valid && subscriptionData.isActive) {
+      setSubscriptionData((current) => current ? { ...current, isActive: false } : null);
+    }
+    return valid;
+  }, [subscriptionData]);
+
+  useEffect(() => {
+    if (!subscriptionData) return;
+    const interval = setInterval(() => { checkSubscriptionValidity(); }, 60000);
     return () => clearInterval(interval);
-  }, [subscriptionData]);
+  }, [subscriptionData, checkSubscriptionValidity]);
 
-  // Check validity when component mounts and subscription data changes
-  useEffect(() => {
-    if (subscriptionData) {
-      checkSubscriptionValidity();
-    }
-  }, [subscriptionData]);
-
-  const setSubscription = (plan: string, paymentData?: any, isAnnual: boolean = false) => {
-    const now = new Date();
-    const endDate = new Date();
-    
-    // Calculate end date based on plan type
-    if (isAnnual) {
-      endDate.setFullYear(endDate.getFullYear() + 1);
-    } else {
-      endDate.setMonth(endDate.getMonth() + 1);
-    }
-    
-    const newSubscriptionData: SubscriptionData = {
-      plan,
-      startDate: now.toISOString(),
-      endDate: endDate.toISOString(),
-      paymentId: paymentData?.razorpay_payment_id,
-      orderId: paymentData?.razorpay_order_id,
-      isActive: true,
-      autoRenew: false, // You can implement auto-renew logic later
-    };
-    
-    setIsSubscribed(true);
-    setSubscriptionPlan(plan);
-    setSubscriptionData(newSubscriptionData);
-    setIsExpired(false);
-    setDaysRemaining(isAnnual ? 365 : 30);
-    
-    // Save to localStorage with anti-tampering measures
-    const savedData = {
-      ...newSubscriptionData,
-      timestamp: Date.now(),
-      checksum: btoa(plan + endDate.toISOString() + 'sportrz_sub_security')
-    };
-    localStorage.setItem('sportrz_subscription', JSON.stringify(savedData));
+  // A verified payment is persisted in MySQL by /api/verify-payment. This method only refreshes the server state.
+  const setSubscription = async (_plan: string, _paymentData?: any, _isAnnual = false) => {
+    await refreshSubscription();
   };
 
-  const clearSubscription = () => {
-    setIsSubscribed(false);
-    setSubscriptionPlan(null);
-    setSubscriptionData(null);
-    setIsExpired(false);
-    setDaysRemaining(0);
-    localStorage.removeItem('sportrz_subscription');
-  };
+  // Client UI state can be cleared locally, but only a server-side subscription operation may change billing records.
+  const clearSubscription = () => applySubscription(null);
 
   return (
     <SubscriptionContext.Provider value={{
@@ -169,7 +109,8 @@ export function SubscriptionProvider({ children }: { children: ReactNode }) {
       daysRemaining,
       setSubscription,
       clearSubscription,
-      checkSubscriptionValidity
+      checkSubscriptionValidity,
+      refreshSubscription,
     }}>
       {children}
     </SubscriptionContext.Provider>
@@ -178,8 +119,6 @@ export function SubscriptionProvider({ children }: { children: ReactNode }) {
 
 export function useSubscription() {
   const context = useContext(SubscriptionContext);
-  if (context === undefined) {
-    throw new Error('useSubscription must be used within a SubscriptionProvider');
-  }
+  if (context === undefined) throw new Error('useSubscription must be used within a SubscriptionProvider');
   return context;
 }

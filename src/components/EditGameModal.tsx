@@ -3,8 +3,6 @@
 
 import { useState, useEffect } from 'react';
 import { X, Save, AlertTriangle, Upload, Image } from 'lucide-react';
-import { db } from '@/lib/firebase';
-import { doc, collection, query, where, getDocs, updateDoc, deleteDoc, setDoc } from 'firebase/firestore';
 import { GameInfo } from '@/types/game';
 
 interface EditGameModalProps {
@@ -104,63 +102,18 @@ export default function EditGameModal({ game, onClose, onSave }: EditGameModalPr
     setIsLoading(true);
     
     try {
-      // Check if the new ID already exists (if ID was changed)
-      if (idChanged) {
-        const q = query(collection(db, 'games'), where('id', '==', formData.id));
-        const querySnapshot = await getDocs(q);
-        
-        if (!querySnapshot.empty) {
-          setError(`A game with ID "${formData.id}" already exists. Please choose a different ID.`);
-          setIsLoading(false);
-          return;
-        }
-      }
-      
-      // Find the document with the original ID
-      const q = query(collection(db, 'games'), where('id', '==', originalId));
-      const querySnapshot = await getDocs(q);
-      
-      if (querySnapshot.empty) {
-        setError('Game not found in database');
-        setIsLoading(false);
-        return;
-      }
-      
-      const gameDoc = querySnapshot.docs[0];
-      
-// Replace the problematic section in handleSubmit with this:
-if (idChanged) {
-  // Create a new document with the new ID
-  const gamesCollection = collection(db, 'games');
-  const newDocRef = doc(gamesCollection);
-  
-  // Use setDoc instead of updateDoc for the new document
-  await setDoc(newDocRef, {
-    id: formData.id,
-    name: formData.name,
-    categories: formData.categories,
-    path: formData.path,
-    thumbnail: formData.thumbnail,
-    updatedAt: new Date().toISOString()
-  });
-  
-  // Delete the old document
-  await deleteDoc(gameDoc.ref);
-} else {
-  // Just update the existing document
-  await updateDoc(gameDoc.ref, {
-    name: formData.name,
-    categories: formData.categories,
-    path: formData.path,
-    thumbnail: formData.thumbnail,
-    updatedAt: new Date().toISOString()
-  });
-}
-      
+      const response = await fetch(`/api/admin/games/${encodeURIComponent(originalId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Failed to update game.');
+
       onSave(formData);
     } catch (err) {
       console.error('Error updating game:', err);
-      setError('Failed to update game. Please try again.');
+      setError(err instanceof Error ? err.message : 'Failed to update game. Please try again.');
     } finally {
       setIsLoading(false);
     }

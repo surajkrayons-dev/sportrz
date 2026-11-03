@@ -22,7 +22,7 @@ export default function TopGameCard({ game, index }: TopGameCardProps) {
     if (game.id === 'arcade5') return '/thumbnails/5.jpg';
     if (game.id === 'arcade10') return '/thumbnails/10.jpg';
     
-    // For all other games, use the Firebase thumbnail
+    // For all other games, use the database thumbnail
     return game.thumbnail;
   };
   

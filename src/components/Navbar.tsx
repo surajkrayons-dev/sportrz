@@ -5,9 +5,7 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/contexts/ToastContext';
-import { Menu, X, User, LogOut, Settings, Crown, Sparkles } from 'lucide-react';
-import { doc, getDoc } from 'firebase/firestore';
-import { db } from '@/lib/firebase';
+import { Menu, X, User, LogOut, Settings, Crown, Sparkles, Mail } from 'lucide-react';
 import SearchBar from '@/components/SearchBar';
 import { useSearch } from '@/contexts/SearchContext';
 import { useTheme } from '@/contexts/ThemeContext';
@@ -39,11 +37,22 @@ export default function Navbar() {
   const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [userAvatar, setUserAvatar] = useState('avatar1');
   const [isLoadingAvatar, setIsLoadingAvatar] = useState(false);
+  const [siteName, setSiteName] = useState('Sportrz');
   const { currentUser, logout } = useAuth();
   const { isAdmin, loading: adminLoading } = useAdmin();
   const { showToast } = useToast();
 
-  // Load user avatar from Firebase
+  // Read the current public site name so admin settings can update the header without a redeploy.
+  useEffect(() => {
+    let active = true;
+    fetch('/api/public-settings', { cache: 'no-store' })
+      .then((response) => response.json())
+      .then((data) => { if (active && typeof data.siteName === 'string' && data.siteName.trim()) setSiteName(data.siteName.trim()); })
+      .catch((error) => console.error('Unable to load site settings:', error));
+    return () => { active = false; };
+  }, []);
+
+  // Load user avatar from MySQL API
   useEffect(() => {
     const loadUserAvatar = async () => {
       if (!currentUser) {
@@ -53,15 +62,10 @@ export default function Navbar() {
 
       setIsLoadingAvatar(true);
       try {
-        const userDocRef = doc(db, 'users', currentUser.uid);
-        const userDoc = await getDoc(userDocRef);
-        
-        if (userDoc.exists()) {
-          const userData = userDoc.data();
-          setUserAvatar(userData.avatar || 'avatar1');
-        } else {
-          setUserAvatar('avatar1');
-        }
+        const response = await fetch('/api/profile', { cache: 'no-store' });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Unable to load avatar.');
+        setUserAvatar(result.profile?.avatar || currentUser.avatar || 'avatar1');
       } catch (error) {
         console.error('Error loading user avatar:', error);
         setUserAvatar('avatar1');
@@ -101,10 +105,10 @@ export default function Navbar() {
   {/* Logo + Title */}
 <Link href="/" className="flex items-center space-x-2 group">
   <div className="w-10 h-10 rounded-xl flex items-center justify-center shadow-lg transform transition-all duration-300 group-hover:scale-105 group-hover:shadow-xl overflow-hidden">
-    <img src="/Logo.png" alt="Sportrz Logo" className="w-full h-full object-contain" />
+    <img src="/Logo.png" alt={`${siteName} Logo`} className="w-full h-full object-contain" />
   </div>
         <span className="text-xl font-bold text-[#FD3207]" style={{ fontFamily: "var(--font-vezla)" }}>
-  SPORTRZ
+  {siteName.toUpperCase()}
 </span>
 </Link>
 
@@ -127,9 +131,9 @@ export default function Navbar() {
 
 
 
-  {/* Right Side: Theme toggle, Premium button, Auth controls */}
+  {/* Right Side: Theme toggle, Premium button, one email access button */}
   <div className="hidden md:flex items-center space-x-8">
-    {/* Theme toggle, Premium Plans, Login/Signup/User info */}
+    {/* Theme toggle, Premium Plans and account controls */}
 
             <button
             onClick={toggleTheme}
@@ -207,20 +211,13 @@ export default function Navbar() {
                 </button>
               </div>
             ) : (
-              <div className="flex items-center space-x-4">
-                <Link
-                  href="/login"
-                  className="text-gray-700 dark:text-gray-300 hover:text-indigo-600 dark:hover:text-indigo-400 px-3 py-2 rounded-md text-sm font-medium transition-colors"
-                >
-                  Sign in
-                </Link>
-                <Link
-                  href="/signup"
-                  className="bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 transform hover:scale-105 hover:shadow-lg"
-                >
-                  Sign up
-                </Link>
-              </div>
+              <Link
+                href="/login"
+                className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-[#ff5526] to-[#ed3424] px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-orange-600/20 transition hover:-translate-y-0.5 hover:shadow-lg"
+              >
+                <Mail className="h-4 w-4" />
+                Continue with email
+              </Link>
             )}
           </div>
           
@@ -327,20 +324,14 @@ export default function Navbar() {
                   </button>
                 </div>
               ) : (
-                <div className="pt-4 pb-3 border-t border-gray-200 dark:border-gray-700 space-y-2">
+                <div className="border-t border-gray-200 pb-3 pt-4 dark:border-gray-700">
                   <Link
                     href="/login"
-                    className="block w-full text-center px-4 py-2 rounded-lg border border-indigo-600 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/50 text-sm font-medium transition-colors"
+                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#ff5526] to-[#ed3424] px-4 py-3 text-center text-sm font-semibold text-white shadow-md shadow-orange-600/20 transition hover:shadow-lg"
                     onClick={() => setIsOpen(false)}
                   >
-                    Sign in
-                  </Link>
-                  <Link
-                    href="/signup"
-                    className="block w-full text-center bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 transform hover:scale-105 hover:shadow-lg"
-                    onClick={() => setIsOpen(false)}
-                  >
-                    Sign up
+                    <Mail className="h-4 w-4" />
+                    Continue with email
                   </Link>
                 </div>
               )}

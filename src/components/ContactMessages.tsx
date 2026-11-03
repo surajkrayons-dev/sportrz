@@ -2,8 +2,6 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { collection, query, orderBy, onSnapshot, doc, updateDoc, deleteDoc } from 'firebase/firestore';
-import { db } from '@/lib/firebase';
 import { useToast } from '@/contexts/ToastContext';
 import { Mail, MailOpen, Trash2, Eye, Clock, User, AtSign } from 'lucide-react';
 
@@ -14,12 +12,12 @@ interface ContactMessage {
   subject: string;
   message: string;
   status: 'read' | 'unread';
-  createdAt: any;
+  createdAt: Date | string;
   timestamp: string;
   userAgent?: string;
 }
 
-export default function ContactMessages() {
+export default function ContactMessages({ canManage = false }: { canManage?: boolean }) {
   const [messages, setMessages] = useState<ContactMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedMessage, setSelectedMessage] = useState<ContactMessage | null>(null);
@@ -27,35 +25,35 @@ export default function ContactMessages() {
   const { showToast } = useToast();
 
   useEffect(() => {
-    const q = query(
-      collection(db, 'contactMessages'),
-      orderBy('createdAt', 'desc')
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const messagesData: ContactMessage[] = [];
-      snapshot.forEach((doc) => {
-        messagesData.push({
-          id: doc.id,
-          ...doc.data()
-        } as ContactMessage);
-      });
-      setMessages(messagesData);
-      setLoading(false);
-    }, (error) => {
-      console.error('Error fetching messages:', error);
-      showToast('Failed to load messages', 'error');
-      setLoading(false);
-    });
-
-    return () => unsubscribe();
+    let active = true;
+    const loadMessages = async () => {
+      try {
+        const response = await fetch('/api/contact', { cache: 'no-store' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Failed to load messages.');
+        if (active) setMessages(data as ContactMessage[]);
+      } catch (error) {
+        console.error('Error fetching messages:', error);
+        if (active) showToast('Failed to load messages', 'error');
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    void loadMessages();
+    const timer = setInterval(() => { void loadMessages(); }, 15000);
+    return () => { active = false; clearInterval(timer); };
   }, [showToast]);
 
   const markAsRead = async (messageId: string) => {
     try {
-      await updateDoc(doc(db, 'contactMessages', messageId), {
-        status: 'read'
+      const response = await fetch('/api/contact', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: messageId, status: 'read' }),
       });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Unable to update message.');
+      setMessages((current) => current.map((message) => message.id === messageId ? { ...message, status: 'read' } : message));
+      setSelectedMessage((current) => current?.id === messageId ? { ...current, status: 'read' } : current);
       showToast('Message marked as read', 'success');
     } catch (error) {
       console.error('Error marking message as read:', error);
@@ -67,7 +65,10 @@ export default function ContactMessages() {
     if (!confirm('Are you sure you want to delete this message?')) return;
     
     try {
-      await deleteDoc(doc(db, 'contactMessages', messageId));
+      const response = await fetch(`/api/contact?id=${encodeURIComponent(messageId)}`, { method: 'DELETE' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Unable to delete message.');
+      setMessages((current) => current.filter((message) => message.id !== messageId));
       showToast('Message deleted successfully', 'success');
       setSelectedMessage(null);
     } catch (error) {
@@ -218,13 +219,13 @@ export default function ContactMessages() {
                   >
                     <Eye className="w-4 h-4" />
                   </button>
-                  <button
+                  {canManage && <button
                     onClick={() => deleteMessage(message.id)}
                     className="p-2 text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-200 transition-colors"
                     title="Delete message"
                   >
                     <Trash2 className="w-4 h-4" />
-                  </button>
+                  </button>}
                 </div>
               </div>
             </div>
@@ -295,7 +296,7 @@ export default function ContactMessages() {
 
               <div className="flex justify-between pt-4">
                 <div className="flex gap-2">
-                  {selectedMessage.status === 'unread' && (
+                  {canManage && selectedMessage.status === 'unread' && (
                     <button
                       onClick={() => markAsRead(selectedMessage.id)}
                       className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition-colors"
@@ -303,12 +304,12 @@ export default function ContactMessages() {
                       Mark as Read
                     </button>
                   )}
-                  <button
+                  {canManage && <button
                     onClick={() => deleteMessage(selectedMessage.id)}
                     className="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors"
                   >
                     Delete Message
-                  </button>
+                  </button>}
                 </div>
                 <button
                   onClick={() => setSelectedMessage(null)}

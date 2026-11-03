@@ -96,6 +96,11 @@ export default function Footer() {
                   Plans
                 </Link>
               </li>
+              <li>
+                <Link href="/affiliate/apply" className="text-gray-600 dark:text-gray-300 hover:text-indigo-600 dark:hover:text-indigo-400 transition-colors">
+                  Affiliate program
+                </Link>
+              </li>
             </ul>
           </div>
 

@@ -1,0 +1,11 @@
+[
+  {
+    "id": "arcade1",
+    "name": "Replace With Real Game Name",
+    "categories": ["Arcade"],
+    "path": "/Games/arcade1/index.html",
+    "thumbnail": "/thumbnails/1.jpg",
+    "description": "Example record only. Replace this record with your actual game catalog.",
+    "uploadOrder": 1
+  }
+]

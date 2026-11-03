@@ -4,12 +4,11 @@ import { useState, useEffect, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { GameInfo } from '@/types/game';
-import { db } from '@/lib/firebase';
 import { GameTrackingService } from '@/lib/gameTrackingService';
 import { useAuth } from '@/contexts/AuthContext';
 import { useSubscription } from '@/contexts/SubscriptionContext';
 import { useGameTimer } from '@/hooks/useGameTimer';
-import { Clock, Crown, Zap, Lock, User, Edit, Shield } from 'lucide-react';
+import { Clock, Crown, Zap, Lock, User, Edit, Shield, Mail } from 'lucide-react';
 import EditGameModal from '@/components/EditGameModal';
 import { useAdmin } from '@/contexts/AdminContext';
 
@@ -21,6 +20,8 @@ export default function GamePage() {
   
   const [isLoading, setIsLoading] = useState(true);
   const [game, setGame] = useState<GameInfo | null>(null);
+  const [gameAccessDenied, setGameAccessDenied] = useState(false);
+  const [gameAccessMessage, setGameAccessMessage] = useState('This game is not included in your current plan.');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showTrialWarning, setShowTrialWarning] = useState(false);
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -28,7 +29,7 @@ export default function GamePage() {
   const { currentUser, loading: authLoading } = useAuth();
   const { isSubscribed, subscriptionPlan } = useSubscription();
   
-  const { isAdmin, loading: adminLoading } = useAdmin();
+  const { isFullAdmin, loading: adminLoading } = useAdmin();
 
   const { 
     timeLeft, 
@@ -36,7 +37,7 @@ export default function GamePage() {
     startTimer, 
     pauseTimer, 
     formatTime 
-  } = useGameTimer(isSubscribed, isAdmin);
+  } = useGameTimer(isSubscribed, isFullAdmin);
 
   const trackGamePlay = async (gameData: any) => {
   if (!currentUser) return;
@@ -69,32 +70,22 @@ export default function GamePage() {
     
     const loadGameData = async () => {
       try {
-        const { collection, query, where, getDocs } = await import('firebase/firestore');
-        
-        console.log('Loading game with ID:', gameId);
-        
-        const q = query(collection(db, 'games'), where('id', '==', gameId));
-        const querySnapshot = await getDocs(q);
-        
-        if (!querySnapshot.empty) {
-          const gameDoc = querySnapshot.docs[0];
-          const data = gameDoc.data();
-          const gameData = { 
-            id: data.id,
-            name: data.name,
-            categories: data.categories,
-            path: data.path,
-            thumbnail: data.thumbnail
-          } as GameInfo;
-          setGame(gameData);
-
-          if (gameData) {
-  trackGamePlay(gameData);
-}
-        } else {
-          console.log('Game not found in Firestore');
+        const response = await fetch(`/api/games?id=${encodeURIComponent(gameId)}`, { cache: 'no-store' });
+        if (response.status === 404) {
           setGame(null);
+          return;
         }
+        if (response.status === 403) {
+          const denied = await response.json().catch(() => ({}));
+          setGameAccessDenied(true);
+          setGameAccessMessage(denied.error || 'Your current plan does not include this game.');
+          setGame(null);
+          return;
+        }
+        if (!response.ok) throw new Error('Unable to load game from the MySQL API.');
+        const gameData = await response.json() as GameInfo;
+        setGame(gameData);
+        await trackGamePlay(gameData);
       } catch (error) {
         console.error('Error loading game data:', error);
         setGame(null);
@@ -117,10 +108,10 @@ export default function GamePage() {
 
   // Show warning when 1 minute left
 useEffect(() => {
-    if (!isAdmin && !isSubscribed && timeLeft <= 60 && timeLeft > 0) {
+    if (!isFullAdmin && !isSubscribed && timeLeft <= 60 && timeLeft > 0) {
       setShowTrialWarning(true);
     }
-  }, [timeLeft, isSubscribed, isAdmin]);
+  }, [timeLeft, isSubscribed, isFullAdmin]);
 
   // Handle visibility change to pause/resume timer
   useEffect(() => {
@@ -180,33 +171,26 @@ useEffect(() => {
               <Lock className="w-10 h-10 text-white" />
             </div>
             
-            <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-4">
-              Login Required
+            <h2 className="mb-3 text-2xl font-bold text-gray-900 dark:text-white">
+              One quick email check
             </h2>
             
-            <p className="text-gray-600 dark:text-gray-400 mb-6">
-              You need to be logged in to access games. Please sign in to your account or create a new one to start playing.
+            <p className="mb-6 text-gray-600 dark:text-gray-400">
+              Verify your email with a one-time code to play. If you are new to Sportrz, your account is created automatically after verification.
             </p>
             
             <div className="space-y-3">
               <Link
                 href="/login"
-                className="w-full bg-gradient-to-r from-indigo-600 to-purple-600 text-white py-3 px-6 rounded-lg font-semibold hover:from-indigo-700 hover:to-purple-700 transition-all duration-200 transform hover:scale-105 flex items-center justify-center space-x-2"
+                className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-[#ff5526] to-[#ed3424] px-6 py-3 font-semibold text-white transition hover:shadow-lg"
               >
-                <User className="w-5 h-5" />
-                <span>Login to Play</span>
-              </Link>
-              
-              <Link
-                href="/signup"
-                className="w-full bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 py-3 px-6 rounded-lg font-medium hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors flex items-center justify-center"
-              >
-                Create Account
+                <Mail className="h-5 w-5" />
+                <span>Continue with email</span>
               </Link>
               
               <Link
                 href="/"
-                className="w-full text-gray-500 dark:text-gray-400 py-2 px-6 rounded-lg font-medium hover:text-gray-700 dark:hover:text-gray-300 transition-colors"
+                className="flex w-full items-center justify-center rounded-lg px-6 py-2 font-medium text-gray-500 transition-colors hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
               >
                 Back to Home
               </Link>
@@ -224,6 +208,19 @@ useEffect(() => {
         <div className="text-center">
           <div className="w-16 h-16 border-4 border-indigo-200 dark:border-indigo-800 border-t-indigo-600 dark:border-t-indigo-400 rounded-full animate-spin"></div>
           <h3 className="mt-4 text-lg font-medium text-gray-900 dark:text-white">Loading Game...</h3>
+        </div>
+      </div>
+    );
+  }
+
+  if (gameAccessDenied) {
+    return (
+      <div className="flex min-h-[70vh] items-center justify-center bg-gray-50 px-4 dark:bg-gray-900">
+        <div className="w-full max-w-lg rounded-3xl border border-orange-200 bg-white p-8 text-center shadow-xl dark:border-slate-700 dark:bg-slate-800">
+          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300"><Lock className="h-7 w-7" /></div>
+          <h1 className="text-2xl font-black text-slate-950 dark:text-white">Game not included in your plan</h1>
+          <p className="mt-3 text-sm leading-6 text-slate-600 dark:text-slate-300">{gameAccessMessage}</p>
+          <div className="mt-6 flex flex-wrap justify-center gap-3"><Link href="/plans" className="rounded-xl bg-orange-600 px-5 py-3 font-semibold text-white hover:bg-orange-700">View plans</Link><Link href="/" className="rounded-xl border border-slate-200 px-5 py-3 font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-600 dark:text-white dark:hover:bg-slate-700">Browse games</Link></div>
         </div>
       </div>
     );
@@ -255,7 +252,7 @@ useEffect(() => {
   }
 
   // Trial expired overlay
-  if (isTrialExpired && !isSubscribed && !isAdmin) {
+  if (isTrialExpired && !isSubscribed && !isFullAdmin) {
     return (
       <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex items-center justify-center">
         <div className="max-w-md w-full mx-4">
@@ -311,7 +308,7 @@ const handleGameUpdate = (updatedGame: GameInfo) => {
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
       {/* Trial Warning Banner */}
-      {showTrialWarning && !isSubscribed && !isAdmin &&(
+      {showTrialWarning && !isSubscribed && !isFullAdmin &&(
         <div className="bg-gradient-to-r from-orange-500 to-red-500 text-white p-4 text-center">
           <div className="flex items-center justify-center space-x-2">
             <Clock className="w-5 h-5" />
@@ -345,7 +342,7 @@ const handleGameUpdate = (updatedGame: GameInfo) => {
               <div className="text-sm text-gray-500 dark:text-gray-400">|</div>
             </div>
                           {/* Admin Edit Button */}
-              {isAdmin && game && (
+              {isFullAdmin && game && (
                 <>
                   <div className="text-sm text-gray-500 dark:text-gray-400">|</div>
                   <button
@@ -361,7 +358,7 @@ const handleGameUpdate = (updatedGame: GameInfo) => {
 
             <div className="flex items-center space-x-4">
               {/* Admin Badge */}
-              {isAdmin && (
+              {isFullAdmin && (
                 <div className="flex items-center space-x-2 bg-purple-100 dark:bg-purple-900/30 px-3 py-1 rounded-lg">
                   <Shield className="w-4 h-4 text-purple-700 dark:text-purple-400" />
                   <span className="text-sm font-medium text-purple-700 dark:text-purple-400">
@@ -380,7 +377,7 @@ const handleGameUpdate = (updatedGame: GameInfo) => {
               </div>
               
               {/* Timer Display */}
-              {!isSubscribed && !isAdmin &&(
+              {!isSubscribed && !isFullAdmin &&(
                 <div className="flex items-center space-x-2 bg-gray-100 dark:bg-gray-700 px-3 py-2 rounded-lg">
                   <Clock className="w-4 h-4 text-gray-600 dark:text-gray-400" />
                   <span className="text-sm font-medium text-gray-900 dark:text-white">
@@ -389,7 +386,7 @@ const handleGameUpdate = (updatedGame: GameInfo) => {
                 </div>
               )}
                          {/* Admin Access Badge - Show instead of subscription or timer */}
-              {isAdmin && (
+              {isFullAdmin && (
                 <div className="flex items-center space-x-2 bg-gradient-to-r from-green-100 to-emerald-100 dark:from-green-900/30 dark:to-emerald-900/30 px-3 py-2 rounded-lg">
                   <Shield className="w-4 h-4 text-green-700 dark:text-green-400" />
                   <span className="text-sm font-medium text-green-700 dark:text-green-400">
@@ -399,11 +396,11 @@ const handleGameUpdate = (updatedGame: GameInfo) => {
               )}
               
               {/* Subscription Status */}
-              {isSubscribed && !isAdmin && (
+              {isSubscribed && !isFullAdmin && (
                 <div className="flex items-center space-x-2 bg-gradient-to-r from-indigo-100 to-purple-100 dark:from-indigo-900 dark:to-purple-900 px-3 py-2 rounded-lg">
                   <Crown className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
                   <span className="text-sm font-medium text-indigo-700 dark:text-indigo-300">
-                    {subscriptionPlan === 'elite' ? 'Elite' : 'Pro'} Member
+                    {subscriptionPlan === 'daily' ? 'Daily' : subscriptionPlan === 'weekly' ? 'Weekly' : subscriptionPlan === 'monthly' ? 'Monthly' : 'Premium'} Member
                   </span>
                 </div>
               )}
@@ -460,7 +457,7 @@ const handleGameUpdate = (updatedGame: GameInfo) => {
               </p>
 
                       {/* Admin Info Box - Show for admins */}
-              {isAdmin && (
+              {isFullAdmin && (
                 <div className="mb-4 p-4 bg-gradient-to-r from-green-50 to-emerald-50 dark:from-green-900/20 dark:to-emerald-900/20 rounded-lg border border-green-200 dark:border-green-800">
                   <div className="flex items-center space-x-2 mb-2">
                     <Shield className="w-5 h-5 text-green-700 dark:text-green-400" />
@@ -475,7 +472,7 @@ const handleGameUpdate = (updatedGame: GameInfo) => {
               )}
 
               {/* Trial Info for Non-Subscribers */}
-              {!isSubscribed &&!isAdmin &&(
+              {!isSubscribed &&!isFullAdmin &&(
                 <div className="mb-4 p-4 bg-gradient-to-r from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 rounded-lg border border-indigo-200 dark:border-indigo-700">
                   <div className="flex items-center space-x-2 mb-2">
                     <Clock className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />

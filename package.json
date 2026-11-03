@@ -1,5 +1,5 @@
 {
-  "name": "tailwind",
+  "name": "sportrz",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "migrate": "node scripts/migrate-to-firebase.js"
+    "db:check": "node scripts/check-db.js",
+    "db:import-games": "node upload-games.js",
+    "db:migrate:admin": "node scripts/migrate-admin.js"
   },
   "dependencies": {
     "@heroicons/react": "^2.2.0",
@@ -16,10 +18,9 @@
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
     "dotenv": "^17.2.0",
-    "firebase": "^11.10.0",
-    "firebase-admin": "^13.4.0",
     "framer-motion": "^12.23.3",
     "lucide-react": "^0.525.0",
+    "mysql2": "^3.14.3",
     "next": "15.3.5",
     "next-cloudinary": "^6.16.0",
     "razorpay": "^2.9.6",
@@ -27,7 +28,8 @@
     "react-dom": "^19.0.0",
     "react-hot-toast": "^2.5.2",
     "tailwind-merge": "^3.3.1",
-    "tailwind-scrollbar-hide": "^4.0.0"
+    "tailwind-scrollbar-hide": "^4.0.0",
+    "nodemailer": "^7.0.5"
   },
   "devDependencies": {
     "@types/node": "^20",
@@ -36,6 +38,7 @@
     "autoprefixer": "^10.4.21",
     "postcss": "^8.5.6",
     "tailwindcss": "^3.4.16",
-    "typescript": "^5"
+    "typescript": "^5",
+    "@types/nodemailer": "^6.4.17"
   }
 }

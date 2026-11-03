@@ -11,6 +11,7 @@ import Footer from '@/components/Footer';
 import { SearchProvider } from '@/contexts/SearchContext';
 import { SubscriptionProvider } from '@/contexts/SubscriptionContext';
 import { NotificationProvider } from '@/contexts/NotificationContext';
+import MaintenanceGate from '@/components/MaintenanceGate';
 import localFont from 'next/font/local';
 
 const inter = Inter({ subsets: ['latin'] });
@@ -45,7 +46,7 @@ export default function RootLayout({
                   <div className="min-h-screen bg-gray-50 dark:bg-gray-900 transition-colors">
                     <Navbar />
                     <main className="flex-1">
-                      {children}
+                      <MaintenanceGate>{children}</MaintenanceGate>
                     </main>
                     <Footer />
                   </div>

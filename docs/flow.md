@@ -1,24 +1,18 @@
-# Application Flow – Sportrz
+# Application Flow — Sportrz
 
-## 👤 User Flow
+## User flow
 
-1. User lands on homepage → browses game catalog.
-2. Unauthenticated users see a "login/signup" prompt when they try to access a game.
-3. Logged-in users:
-   - View dashboard with recommendations
-   - Browse games and add to favorites
-   - Subscribe to a 1-day/weekly/monthly plan
-4. Users can:
-   - Add friends
-   - View friend activities (shared games)
-   - See suggested games based on mutual interests
+1. A visitor opens the home page and browses the game catalog by category or search.
+2. A user registers with email/password, verifies the email, and signs in; Google OAuth is optional.
+3. Signed-in users can manage their profile, play games, see recently played games, and use notifications.
+4. Users can submit contact messages and feedback.
+5. Signed-in users can purchase an enabled plan through Razorpay. The server verifies the payment with Razorpay and stores the payment/subscription records in MySQL.
 
-## 🔁 Data Flow
+## Data flow
 
-- Games (catalog) are fetched from the database.
-- User actions (login, purchase, add-friend) trigger API routes.
-- Recommendation engine uses:
-   - Game tags/interests
-   - Friend activities
-   - Past access history
-
+- `games` plus `game_categories` provide the catalog; category metadata is stored in `categories`.
+- `users`, `auth_tokens`, and `oauth_accounts` handle identity and verification data.
+- `game_play_history` and `notifications` store per-user activity.
+- `payments`, `plans`, and `subscriptions` record purchases and access periods.
+- `contact_messages` and `feedback` store user submissions.
+- Protected admin APIs verify the signed session and the `users.is_admin` flag before changing catalog data.

@@ -1,37 +1,29 @@
-# Tech Stack – Sportrz
+# Sportrz — Current Tech Stack
 
-## 🧱 Frontend
+## Frontend
+- Next.js App Router (Next.js 15)
+- React 19 and TypeScript
+- Tailwind CSS
 
-- **Next.js 14** – Modern React framework with App Router
-- **Tailwind CSS** – Utility-first styling for speed and responsiveness
-- **TypeScript** – Strongly typed code
+## Backend
+- Next.js Route Handlers (`src/app/api/**`)
+- `mysql2/promise` connection pool for MySQL
+- HTTP-only, HMAC-signed session cookie
+- Password hashing with Node.js `scrypt`
+- Optional Google OAuth 2.0 sign-in
 
-## 🔐 Auth
+## Database
+- MySQL / compatible MySQL service
+- Schema: `database/schema.sql`
+- Local environment template: `.env.example`
+- Game catalog importer: `upload-games.js`
 
-- **NextAuth.js** – Secure user authentication with support for email/password or OAuth
+## Integrations
+- Razorpay for one-day, weekly, and monthly access plans
+- Cloudinary for administrator-uploaded game thumbnails
+- Resend for production email verification and password-reset emails
 
-## 🧠 Backend
-
-- **Next.js API routes** – Lightweight backend logic
-- **Prisma** – Type-safe ORM for database operations
-
-## 🗃️ Database
-
-- **PostgreSQL**
-  - Hosted on Supabase, Neon, or Railway
-  - Supports relational data: users, games, subscriptions, friends, etc.
-  - Scalable to support multiple countries
-
-## 💳 Payments
-
-- **Stripe**
-  - One-day access plan
-  - Subscription logic
-  - Webhooks for validation
-
-## 📦 Dev Tools
-
-- **Vercel** – For frontend deployment
-- **Prisma Studio** – For managing DB
-- **Postman** – API testing
-
+## Deployment
+- Node.js hosting that can run the Next.js production server
+- Configure the production database, authentication secret, email provider, OAuth, Razorpay, and Cloudinary through server-side environment variables
+- Verify database connectivity at `/api/health` after deployment

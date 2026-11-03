@@ -2,8 +2,6 @@
 
 import { useState, useEffect } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { db } from '@/lib/firebase';
-import { collection, getDocs } from 'firebase/firestore';
 import GameCard from '@/components/GameCard';
 import LoadingSpinner from '@/components/LoadingSpinner';
 import { GameInfo } from '@/types/game';
@@ -45,23 +43,9 @@ export default function CategoryPage() {
         const properCategoryName = slugToCategory(slug);
         setCategoryName(properCategoryName);
         
-        // Query games by category
-        const gamesRef = collection(db, 'games');
-        const gamesSnapshot = await getDocs(gamesRef);
-        
-        const categoryGames: GameInfo[] = [];
-        gamesSnapshot.forEach((doc) => {
-          const data = doc.data();
-          if (data.categories && data.categories.includes(properCategoryName)) {
-            categoryGames.push({
-              id: data.id,
-              name: data.name,
-              categories: data.categories,
-              path: data.path,
-              thumbnail: data.thumbnail
-            } as GameInfo);
-          }
-        });
+        const response = await fetch(`/api/games?category=${encodeURIComponent(properCategoryName)}`, { cache: 'no-store' });
+        if (!response.ok) throw new Error('Unable to load category games.');
+        const categoryGames = await response.json() as GameInfo[];
         
         // Sort games by numeric ID
         categoryGames.sort((a, b) => {

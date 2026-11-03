@@ -5,11 +5,7 @@ import { useState, useEffect } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/contexts/ToastContext';
 import { User, Edit2, Save, X, Camera } from 'lucide-react';
-import { updateProfile } from 'firebase/auth';
-import { doc, setDoc, getDoc } from 'firebase/firestore';
-import { db } from '@/lib/firebase';
 import SubscriptionStatus from '@/components/SubscriptionStatus';
-import { Sub } from '@radix-ui/react-dropdown-menu';
 
 
 const AVATAR_OPTIONS = [
@@ -21,7 +17,7 @@ const AVATAR_OPTIONS = [
 ];
 
 export default function ProfilePage() {
-  const { currentUser } = useAuth();
+  const { currentUser, refreshUser } = useAuth();
   const { showToast } = useToast();
   const [isEditing, setIsEditing] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -41,36 +37,22 @@ export default function ProfilePage() {
     avatar: 'avatar1',
   });
 
-  // Load user profile data from Firebase
+  // Load user profile data from MySQL
   useEffect(() => {
     const loadUserProfile = async () => {
       if (!currentUser) return;
       
       setIsLoadingProfile(true);
       try {
-        const userDocRef = doc(db, 'users', currentUser.uid);
-        const userDoc = await getDoc(userDocRef);
-        
-        let userData = {
-          displayName: currentUser.displayName || '',
-          email: currentUser.email || '',
-          avatar: 'avatar1', // default
+        const response = await fetch('/api/profile', { cache: 'no-store' });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Unable to load profile.');
+        const serverProfile = result.profile;
+        const userData = {
+          displayName: serverProfile.displayName || currentUser.displayName || '',
+          email: serverProfile.email || currentUser.email || '',
+          avatar: serverProfile.avatar || 'avatar1',
         };
-
-        if (userDoc.exists()) {
-          const firestoreData = userDoc.data();
-          userData = {
-            ...userData,
-            avatar: firestoreData.avatar || 'avatar1',
-          };
-        } else {
-          // Create initial user document if it doesn't exist
-          await setDoc(userDocRef, {
-            avatar: 'avatar1',
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          });
-        }
 
         setProfileData(userData);
         setFormData({
@@ -110,17 +92,14 @@ export default function ProfilePage() {
 
     setIsLoading(true);
     try {
-      // Update Firebase Auth profile
-      await updateProfile(currentUser, {
-        displayName: formData.displayName,
+      const response = await fetch('/api/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(formData),
       });
-
-      // Update Firestore user document
-      const userDocRef = doc(db, 'users', currentUser.uid);
-      await setDoc(userDocRef, {
-        avatar: formData.avatar,
-        updatedAt: new Date(),
-      }, { merge: true });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'Unable to save your profile.');
+      await refreshUser();
 
       // Update local state
       setProfileData({

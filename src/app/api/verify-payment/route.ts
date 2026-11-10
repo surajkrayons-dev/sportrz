@@ -4,6 +4,7 @@ import { getPool } from '@/lib/mysql';
 import { getCurrentUser } from '@/lib/session';
 import { getRazorpayConfig } from '@/lib/payment-settings';
 import { ensureAffiliateCommissionForPayment } from '@/lib/affiliate-commission';
+import { dispatchAffiliatePostbacksForPayment } from '@/lib/affiliate-postback';
 
 export const runtime = 'nodejs';
 
@@ -53,6 +54,9 @@ export async function POST(request: NextRequest) {
       } finally {
         connection.release();
       }
+      await dispatchAffiliatePostbacksForPayment(Number(order.id)).catch((error) => {
+        console.error('Affiliate postback dispatch failed after payment reconciliation:', error);
+      });
       return NextResponse.json({ success: true, message: 'Payment already verified.' });
     }
     if (order.status !== 'created' && order.status !== 'authorized') {
@@ -79,13 +83,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Payment details do not match the recorded order.' }, { status: 400 });
     }
 
-    const durationDays = Number(order.duration_days);
-    if (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 3650) {
+    const durationDays = order.duration_days == null ? null : Number(order.duration_days);
+    if (durationDays !== null && (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 3650)) {
       return NextResponse.json({ error: 'The purchased plan duration is invalid.' }, { status: 500 });
     }
 
     const pool = getPool();
     const connection = await pool.getConnection();
+    let alreadyCapturedDuringLock = false;
     try {
       await connection.beginTransaction();
       const [lockedRows] = await connection.execute<any[]>(
@@ -93,34 +98,36 @@ export async function POST(request: NextRequest) {
         [order.id, user.uid],
       );
       if (!lockedRows.length) throw new Error('Payment order disappeared during verification.');
+
       if (lockedRows[0].status === 'captured') {
-        await ensureAffiliateCommissionForPayment(connection, Number(order.id));
-        await connection.commit();
-        return NextResponse.json({ success: true, message: 'Payment already verified.' });
+        alreadyCapturedDuringLock = true;
+      } else {
+        await connection.execute(
+          `UPDATE payments
+           SET status = 'captured', provider_payment_id = ?, paid_at = UTC_TIMESTAMP(), provider_payload = ?, updated_at = UTC_TIMESTAMP()
+           WHERE id = ?`,
+          [paymentId, JSON.stringify(paymentData), order.id],
+        );
+        await connection.execute(
+          `UPDATE subscriptions SET status = 'expired', updated_at = UTC_TIMESTAMP()
+           WHERE user_id = ? AND status = 'active' AND end_at IS NOT NULL AND end_at <= UTC_TIMESTAMP()`,
+          [user.uid],
+        );
+        await connection.execute(
+          `UPDATE subscriptions SET status = 'cancelled', updated_at = UTC_TIMESTAMP()
+           WHERE user_id = ? AND status = 'active'`,
+          [user.uid],
+        );
+        await connection.execute(
+          `INSERT INTO subscriptions (user_id, plan_id, payment_record_id, status, source, start_at, end_at)
+           VALUES (?, ?, ?, 'active', 'purchase', UTC_TIMESTAMP(), ${durationDays === null ? 'NULL' : 'DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? DAY)'})`,
+          durationDays === null
+            ? [user.uid, Number(order.plan_id), Number(order.id)]
+            : [user.uid, Number(order.plan_id), Number(order.id), durationDays],
+        );
       }
 
-      await connection.execute(
-        `UPDATE payments
-         SET status = 'captured', provider_payment_id = ?, paid_at = UTC_TIMESTAMP(), provider_payload = ?, updated_at = UTC_TIMESTAMP()
-         WHERE id = ?`,
-        [paymentId, JSON.stringify(paymentData), order.id],
-      );
-      await connection.execute(
-        `UPDATE subscriptions SET status = 'expired', updated_at = UTC_TIMESTAMP()
-         WHERE user_id = ? AND status = 'active' AND end_at IS NOT NULL AND end_at <= UTC_TIMESTAMP()`,
-        [user.uid],
-      );
-      await connection.execute(
-        `UPDATE subscriptions SET status = 'cancelled', updated_at = UTC_TIMESTAMP()
-         WHERE user_id = ? AND status = 'active'`,
-        [user.uid],
-      );
-      await connection.execute(
-        `INSERT INTO subscriptions (user_id, plan_id, payment_record_id, status, source, start_at, end_at)
-         VALUES (?, ?, ?, 'active', 'purchase', UTC_TIMESTAMP(), DATE_ADD(UTC_TIMESTAMP(), INTERVAL ${durationDays} DAY))`,
-        [user.uid, Number(order.plan_id), Number(order.id)],
-      );
-      // Create a commission snapshot using the same idempotent path used by retries.
+      // Reconcile commissions on both the normal path and a concurrent capture retry.
       await ensureAffiliateCommissionForPayment(connection, Number(order.id));
       await connection.commit();
     } catch (error) {
@@ -130,6 +137,12 @@ export async function POST(request: NextRequest) {
       connection.release();
     }
 
+    // The payment is already committed. A partner postback failure must not
+    // change the successful checkout response or roll back the subscription.
+    await dispatchAffiliatePostbacksForPayment(Number(order.id)).catch((error) => {
+      console.error('Affiliate postback dispatch failed after captured payment:', error);
+    });
+
     const [subscriptionRows] = await pool.execute<any[]>(
       `SELECT start_at, end_at FROM subscriptions
        WHERE user_id = ? AND payment_record_id = ? ORDER BY id DESC LIMIT 1`,
@@ -138,13 +151,13 @@ export async function POST(request: NextRequest) {
     const savedSubscription = subscriptionRows[0];
     return NextResponse.json({
       success: true,
-      message: 'Payment verified and subscription activated.',
+      message: alreadyCapturedDuringLock ? 'Payment already verified.' : 'Payment verified and subscription activated.',
       subscription: {
         plan: order.plan_code,
         paymentId,
         orderId,
         startDate: savedSubscription?.start_at ? new Date(savedSubscription.start_at).toISOString() : new Date().toISOString(),
-        endDate: savedSubscription?.end_at ? new Date(savedSubscription.end_at).toISOString() : new Date(Date.now() + durationDays * 86400000).toISOString(),
+        endDate: savedSubscription?.end_at ? new Date(savedSubscription.end_at).toISOString() : durationDays === null ? null : new Date(Date.now() + durationDays * 86400000).toISOString(),
         isActive: true,
       },
     });

@@ -33,7 +33,7 @@ export async function GET() {
       const publicOrigin = process.env.NEXT_PUBLIC_APP_URL;
       const fallbackOrigin = process.env.NODE_ENV === 'production' ? 'https://sportrz.com' : 'http://localhost:3000';
       const origin = (publicOrigin && !/^https?:\/\/localhost(?::\d+)?$/i.test(publicOrigin) ? publicOrigin : fallbackOrigin).replace(/\/$/, '');
-      return NextResponse.json({ state: 'affiliate', profile: { ...profiles[0], referralUrl: `${origin}/login?ref=${encodeURIComponent(profiles[0].referral_code)}` } });
+      return NextResponse.json({ state: 'affiliate', profile: { ...profiles[0], referralUrl: `${origin}/login?ref=${encodeURIComponent(profiles[0].referral_code)}${profiles[0].affiliate_type === 'external_website' ? '&click_id={click_id}' : ''}` } });
     }
     const [applications] = await pool.execute<Array<RowDataPacket & { id: number; website_url: string; status: string; review_note: string | null; created_at: Date | string; updated_at: Date | string }>>(
       'SELECT id, website_url, status, review_note, created_at, updated_at FROM affiliate_applications WHERE user_id = ? LIMIT 1', [user.uid],

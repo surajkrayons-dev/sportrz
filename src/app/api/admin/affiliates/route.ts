@@ -26,13 +26,13 @@ export async function GET() {
 
     // Affiliate views are deliberately scoped by the authenticated session user ID.
     if (actor.isAffiliate) {
-      const [profileRows] = await pool.execute<Array<RowDataPacket & { referral_code: string; commission_percent: number; status: string; payout_email: string | null; affiliate_type: string; website_url: string | null }>>(
-        "SELECT ap.referral_code, ap.commission_percent, ap.status, ap.payout_email, ap.affiliate_type, ap.website_url FROM affiliate_profiles ap JOIN users u ON u.id = ap.user_id WHERE ap.user_id = ? AND u.account_role = 'affiliate' LIMIT 1", [actor.id],
+      const [profileRows] = await pool.execute<Array<RowDataPacket & { referral_code: string; commission_percent: number; status: string; payout_email: string | null; affiliate_type: string; website_url: string | null; postback_url: string | null }>>(
+        "SELECT ap.referral_code, ap.commission_percent, ap.status, ap.payout_email, ap.affiliate_type, ap.website_url, ap.postback_url FROM affiliate_profiles ap JOIN users u ON u.id = ap.user_id WHERE ap.user_id = ? AND u.account_role = 'affiliate' LIMIT 1", [actor.id],
       );
       const profile = profileRows[0];
       if (!profile) return NextResponse.json({ affiliate: null, referrals: [], commissions: [], scope: 'own-referrals-only' });
-      const [referrals] = await pool.execute<Array<RowDataPacket & { id: string; email: string; display_name: string | null; created_at: Date | string; active_subscription: string | null; captured_payments: number }>>(
-        `SELECT u.id, u.email, u.display_name, ar.created_at,
+      const [referrals] = await pool.execute<Array<RowDataPacket & { id: string; email: string; display_name: string | null; created_at: Date | string; active_subscription: string | null; captured_payments: number; click_id: string | null }>>(
+        `SELECT u.id, u.email, u.display_name, ar.created_at, ar.click_id,
           (SELECT pl.code FROM subscriptions s JOIN plans pl ON pl.id = s.plan_id WHERE s.user_id = u.id AND s.status = 'active' AND (s.end_at IS NULL OR s.end_at > UTC_TIMESTAMP()) ORDER BY s.end_at DESC LIMIT 1) AS active_subscription,
           (SELECT COUNT(*) FROM payments p WHERE p.user_id = u.id AND p.status = 'captured' AND COALESCE(p.paid_at, p.created_at) >= ar.created_at) AS captured_payments
          FROM affiliate_referrals ar JOIN users u ON u.id = ar.referred_user_id
@@ -56,18 +56,43 @@ export async function GET() {
          FROM affiliate_commissions ac JOIN payments p ON p.id = ac.payment_record_id
          WHERE ac.affiliate_user_id = ? GROUP BY ac.status, p.currency ORDER BY ac.status, p.currency`, [actor.id],
       );
+      const [commissionTransactions] = await pool.execute<Array<RowDataPacket & {
+        id: number; referred_email: string; referred_name: string | null; plan_name: string; plan_code: string; click_id: string | null;
+        order_id: string; provider_payment_id: string | null; amount_paise: number; commission_percent: number;
+        commission_paise: number; currency: string; status: string; paid_at: Date | string | null;
+        created_at: Date | string; postback_status: string | null; postback_http_status: number | null;
+      }>>(
+        `SELECT ac.id, ru.email AS referred_email, ru.display_name AS referred_name,
+                pl.name AS plan_name, pl.code AS plan_code, ar.click_id, p.order_id, p.provider_payment_id,
+                ac.amount_paise, ac.commission_percent, ac.commission_paise, p.currency,
+                ac.status, p.paid_at, ac.created_at,
+                d.status AS postback_status, d.http_status AS postback_http_status
+           FROM affiliate_commissions ac
+           JOIN payments p ON p.id = ac.payment_record_id
+           JOIN plans pl ON pl.id = p.plan_id
+           JOIN users ru ON ru.id = ac.referred_user_id
+           LEFT JOIN affiliate_referrals ar
+             ON ar.referred_user_id = ac.referred_user_id
+            AND ar.affiliate_user_id = ac.affiliate_user_id
+           LEFT JOIN affiliate_postback_deliveries d ON d.commission_id = ac.id
+          WHERE ac.affiliate_user_id = ?
+          ORDER BY COALESCE(p.paid_at, ac.created_at) DESC, ac.id DESC
+          LIMIT 500`,
+        [actor.id],
+      );
       const origin = appOrigin();
       return NextResponse.json({
-        affiliate: { ...profile, commission_percent: Number(profile.commission_percent), referral_url: `${origin}/login?ref=${encodeURIComponent(profile.referral_code)}` },
-        referrals: referrals.map((r) => ({ id: r.id, email: r.email, displayName: r.display_name || '', referredAt: r.created_at, activeSubscription: r.active_subscription, capturedPayments: Number(r.captured_payments || 0), revenueByCurrency: revenueMap.get(r.id) || [] })),
+        affiliate: { ...profile, commission_percent: Number(profile.commission_percent), referral_url: `${origin}/login?ref=${encodeURIComponent(profile.referral_code)}${profile.affiliate_type === 'external_website' ? '&click_id={click_id}' : ''}` },
+        referrals: referrals.map((r) => ({ id: r.id, email: r.email, displayName: r.display_name || '', referredAt: r.created_at, clickId: r.click_id || '', activeSubscription: r.active_subscription, capturedPayments: Number(r.captured_payments || 0), revenueByCurrency: revenueMap.get(r.id) || [] })),
         commissions: commissionRows.map((r) => ({ status: r.status, currency: r.currency || 'INR', amount: Number(r.total_paise || 0) / 100, count: Number(r.count || 0) })),
+        commissionTransactions: commissionTransactions.map((r) => ({ id: Number(r.id), referredEmail: r.referred_email, referredName: r.referred_name || '', clickId: r.click_id || '', planName: r.plan_name, planCode: r.plan_code, orderId: r.order_id, paymentId: r.provider_payment_id || '', amount: Number(r.amount_paise || 0) / 100, currency: r.currency || 'INR', commissionPercent: Number(r.commission_percent || 0), commission: Number(r.commission_paise || 0) / 100, status: r.status, paidAt: r.paid_at, createdAt: r.created_at, postbackStatus: r.postback_status || 'not_configured', postbackHttpStatus: r.postback_http_status == null ? null : Number(r.postback_http_status) })),
         scope: 'own-referrals-only',
       }, { headers: { 'Cache-Control': 'no-store' } });
     }
 
-    const [rows] = await pool.query<Array<RowDataPacket & { user_id: string; email: string; display_name: string | null; referral_code: string; commission_percent: number; affiliate_status: string; affiliate_type: string; website_url: string | null; created_at: Date | string; referral_count: number; converted_count: number }>>(
+    const [rows] = await pool.query<Array<RowDataPacket & { user_id: string; email: string; display_name: string | null; referral_code: string; commission_percent: number; affiliate_status: string; affiliate_type: string; website_url: string | null; postback_url: string | null; created_at: Date | string; referral_count: number; converted_count: number }>>(
       `SELECT u.id AS user_id, u.email, u.display_name, ap.referral_code, ap.commission_percent,
-        ap.status AS affiliate_status, ap.affiliate_type, ap.website_url, ap.created_at,
+        ap.status AS affiliate_status, ap.affiliate_type, ap.website_url, ap.postback_url, ap.created_at,
         (SELECT COUNT(*) FROM affiliate_referrals ar WHERE ar.affiliate_user_id = ap.user_id AND ar.status = 'qualified') AS referral_count,
         (SELECT COUNT(DISTINCT ar.referred_user_id) FROM affiliate_referrals ar JOIN payments p ON p.user_id = ar.referred_user_id AND p.status = 'captured' WHERE ar.affiliate_user_id = ap.user_id AND ar.status = 'qualified' AND COALESCE(p.paid_at, p.created_at) >= ar.created_at) AS converted_count
        FROM affiliate_profiles ap JOIN users u ON u.id = ap.user_id WHERE u.account_role = 'affiliate' ORDER BY ap.created_at DESC`,
@@ -85,10 +110,10 @@ export async function GET() {
       values.push({ currency: row.currency || 'INR', total: Number(row.total_paise || 0) / 100, pending: Number(row.pending_paise || 0) / 100 });
       totalsMap.set(row.affiliate_user_id, values);
     }
-    const [ledgerRows] = await pool.query<Array<RowDataPacket & { id: number; affiliate_email: string; affiliate_name: string | null; referred_email: string; amount_paise: number; commission_percent: number; commission_paise: number; currency: string; status: string; payment_record_id: number; created_at: Date | string }>>(
+    const [ledgerRows] = await pool.query<Array<RowDataPacket & { id: number; affiliate_email: string; affiliate_name: string | null; referred_email: string; amount_paise: number; commission_percent: number; commission_paise: number; currency: string; status: string; payment_record_id: number; order_id: string; provider_payment_id: string | null; plan_name: string; paid_at: Date | string | null; created_at: Date | string }>>(
       `SELECT ac.id, au.email AS affiliate_email, au.display_name AS affiliate_name, ru.email AS referred_email,
-        ac.amount_paise, ac.commission_percent, ac.commission_paise, p.currency, ac.status, ac.payment_record_id, ac.created_at
-       FROM affiliate_commissions ac JOIN payments p ON p.id = ac.payment_record_id JOIN users au ON au.id = ac.affiliate_user_id JOIN users ru ON ru.id = ac.referred_user_id
+        ac.amount_paise, ac.commission_percent, ac.commission_paise, p.currency, ac.status, ac.payment_record_id, p.order_id, p.provider_payment_id, pl.name AS plan_name, p.paid_at, ac.created_at
+       FROM affiliate_commissions ac JOIN payments p ON p.id = ac.payment_record_id JOIN plans pl ON pl.id = p.plan_id JOIN users au ON au.id = ac.affiliate_user_id JOIN users ru ON ru.id = ac.referred_user_id
        ORDER BY ac.created_at DESC LIMIT 500`,
     );
     const [applications] = await pool.query<Array<RowDataPacket & { id: number; user_id: string; email: string; display_name: string | null; website_url: string; status: string; review_note: string | null; created_at: Date | string }>>(
@@ -100,12 +125,12 @@ export async function GET() {
     const origin = appOrigin();
     return NextResponse.json({
       affiliates: rows.map((row) => ({ userId: row.user_id, email: row.email, displayName: row.display_name || '', referralCode: row.referral_code,
-        affiliateType: row.affiliate_type || 'admin_created', websiteUrl: row.website_url || '', commissionPercent: Number(row.commission_percent), status: row.affiliate_status, createdAt: row.created_at,
+        affiliateType: row.affiliate_type || 'admin_created', websiteUrl: row.website_url || '', postbackUrl: row.postback_url || '', postbackConfigured: Boolean(row.postback_url), commissionPercent: Number(row.commission_percent), status: row.affiliate_status, createdAt: row.created_at,
         referralCount: Number(row.referral_count || 0), convertedCount: Number(row.converted_count || 0), commissionByCurrency: totalsMap.get(row.user_id) || [],
-        referralUrl: `${origin}/login?ref=${encodeURIComponent(row.referral_code)}` })),
+        referralUrl: `${origin}/login?ref=${encodeURIComponent(row.referral_code)}${row.affiliate_type === 'external_website' ? '&click_id={click_id}' : ''}` })),
       commissionLedger: ledgerRows.map((row) => ({ id: Number(row.id), affiliateEmail: row.affiliate_email, affiliateName: row.affiliate_name || '', referredEmail: row.referred_email,
         amount: Number(row.amount_paise || 0) / 100, currency: row.currency || 'INR', commissionPercent: Number(row.commission_percent || 0), commission: Number(row.commission_paise || 0) / 100,
-        status: row.status, paymentRecordId: Number(row.payment_record_id), createdAt: row.created_at })),
+        status: row.status, paymentRecordId: Number(row.payment_record_id), orderId: row.order_id, paymentId: row.provider_payment_id || '', planName: row.plan_name, paidAt: row.paid_at, createdAt: row.created_at })),
       applications: applications.map((row) => ({ id: Number(row.id), userId: row.user_id, email: row.email, displayName: row.display_name || '', websiteUrl: row.website_url, status: row.status, reviewNote: row.review_note, createdAt: row.created_at })),
       scope: 'all-affiliates',
     }, { headers: { 'Cache-Control': 'no-store' } });

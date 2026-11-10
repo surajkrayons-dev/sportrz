@@ -1,5 +1,7 @@
 import type { RowDataPacket } from 'mysql2/promise';
 import { getPool } from '@/lib/mysql';
+import { ensureAffiliateCommissionForPayment } from '@/lib/affiliate-commission';
+import { dispatchAffiliatePostbacksForPayment } from '@/lib/affiliate-postback';
 
 export class PaymentSettlementError extends Error {
   status: number;
@@ -71,23 +73,19 @@ export async function finalizeCapturedRazorpayPayment(input: CapturedRazorpayPay
       savedSubscription = newRows[0];
     }
 
-    // This is idempotent per payment_record_id. The stored percentage is a snapshot of the profile rate at capture time.
-    await connection.execute(
-      `INSERT IGNORE INTO affiliate_commissions (affiliate_user_id, referred_user_id, payment_record_id, amount_paise, commission_percent, commission_paise, status)
-       SELECT ar.affiliate_user_id, ar.referred_user_id, p.id, p.amount_paise, ap.commission_percent,
-              FLOOR(p.amount_paise * ap.commission_percent / 100), 'pending'
-       FROM payments p
-       JOIN affiliate_referrals ar ON ar.referred_user_id = p.user_id AND ar.status = 'qualified' AND COALESCE(p.paid_at, p.created_at) >= ar.created_at
-       JOIN affiliate_profiles ap ON ap.user_id = ar.affiliate_user_id AND ap.status = 'active'
-       JOIN users au ON au.id = ap.user_id AND au.account_role = 'affiliate' AND au.status = 'active'
-       WHERE p.id = ? LIMIT 1`, [Number(order.id)],
-    );
+    // Store the commission snapshot and queue an external partner postback atomically.
+    await ensureAffiliateCommissionForPayment(connection, Number(order.id));
 
     await connection.commit();
     const toIso = (value: Date | string | null | undefined): string | null => {
       if (!value) return null;
       return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
     };
+    // A partner callback must never undo a captured payment if their server is down.
+    await dispatchAffiliatePostbacksForPayment(Number(order.id)).catch((error) => {
+      console.error('Affiliate postback dispatch failed after captured payment:', error);
+    });
+
     return {
       alreadyApplied: Boolean(existingSubscriptionRows[0]),
       userId: order.user_id,

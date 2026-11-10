@@ -38,7 +38,8 @@ export async function POST(request: NextRequest) {
   let blocked = false;
   let blockedReason = '';
   let attemptsLeft = 5;
-  let referralCode = ''; 
+  let referralCode = '';
+  let referralClickId = '';
 
   let connection: Awaited<ReturnType<ReturnType<typeof getPool>['getConnection']>> | null = null;
   let transactionStarted = false;
@@ -48,7 +49,9 @@ export async function POST(request: NextRequest) {
     email = String(body.email || '').trim().toLowerCase();
     const otp = String(body.otp || '').trim();
     referralCode = String(body.referralCode || '').trim().toUpperCase();
+    referralClickId = String(body.clickId || '').trim();
     if (referralCode && !/^[A-Z0-9-]{3,32}$/.test(referralCode)) referralCode = '';
+    if (referralClickId && !/^[A-Za-z0-9._~-]{1,191}$/.test(referralClickId)) referralClickId = '';
 
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 191) {
       return NextResponse.json({ error: 'Please enter a valid email address.' }, { status: 400 });
@@ -146,9 +149,9 @@ export async function POST(request: NextRequest) {
           if (affiliateRows[0] && affiliateRows[0].user_id !== userId) {
             await connection.execute(
               `INSERT IGNORE INTO affiliate_referrals
-                 (affiliate_user_id, referred_user_id, referral_code, source, status, created_at)
-               VALUES (?, ?, ?, 'link', 'qualified', UTC_TIMESTAMP())`,
-              [affiliateRows[0].user_id, userId, referralCode],
+                 (affiliate_user_id, referred_user_id, referral_code, click_id, source, status, created_at)
+               VALUES (?, ?, ?, ?, 'link', 'qualified', UTC_TIMESTAMP())`,
+              [affiliateRows[0].user_id, userId, referralCode, referralClickId || null],
             );
           }
         }

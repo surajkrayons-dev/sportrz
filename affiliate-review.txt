@@ -1,0 +1,1376 @@
+
+
+========================================
+FILE: .\src\app\api\create-order\route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { getPool } from '@/lib/mysql';
+import type { RowDataPacket } from 'mysql2/promise';
+import { getCurrentUser } from '@/lib/session';
+import { getRazorpayConfig } from '@/lib/payment-settings';
+
+export const runtime = 'nodejs';
+
+export async function POST(request: NextRequest) {
+  try {
+    const user = await getCurrentUser();
+    if (!user) return NextResponse.json({ error: 'Sign in before purchasing a plan.' }, { status: 401 });
+
+    const body = await request.json();
+    const planCode = String(body.planId || '').trim().toLowerCase();
+    if (!/^[a-z0-9_-]{1,50}$/.test(planCode)) {
+      return NextResponse.json({ error: 'Please select a valid subscription plan.' }, { status: 400 });
+    }
+
+    const [planRows] = await getPool().execute<any[]>(
+      `SELECT id, code, name, price_paise, currency, duration_days
+       FROM plans WHERE code = ? AND is_active = 1 LIMIT 1`,
+      [planCode],
+    );
+    const plan = planRows[0];
+    if (!plan) {
+      return NextResponse.json({ error: 'This plan is currently disabled. Please contact the site administrator.' }, { status: 409 });
+    }
+    const amountPaise = Number(plan.price_paise);
+    const durationDays = plan.duration_days == null ? null : Number(plan.duration_days);
+    if (!Number.isSafeInteger(amountPaise) || amountPaise <= 0 || (durationDays !== null && (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 3650))) {
+      return NextResponse.json({ error: 'The selected plan has an invalid price or duration. Please contact the site administrator.' }, { status: 409 });
+    }
+
+    const razorpayConfig = await getRazorpayConfig();
+    const razorpayKeyId = razorpayConfig?.keyId;
+    const razorpaySecret = razorpayConfig?.secret;
+    if (!razorpayKeyId || !razorpaySecret) {
+      return NextResponse.json({ error: 'Razorpay credentials are not configured on the server.' }, { status: 500 });
+    }
+
+    const currency = String(plan.currency || 'INR').toUpperCase();
+
+    // Keep an auditable attribution snapshot on the Razorpay Order itself.
+    // This data is generated server-side from MySQL; it is not accepted from the browser.
+    const [referralRows] = await getPool().execute<Array<RowDataPacket & {
+      affiliate_user_id: string;
+      referral_code: string;
+      affiliate_email: string;
+      affiliate_name: string | null;
+    }>>(
+      `SELECT ar.affiliate_user_id, ar.referral_code,
+              au.email AS affiliate_email, au.display_name AS affiliate_name
+         FROM affiliate_referrals ar
+         JOIN affiliate_profiles ap ON ap.user_id = ar.affiliate_user_id
+         JOIN users au ON au.id = ar.affiliate_user_id
+        WHERE ar.referred_user_id = ? AND ar.status = 'qualified'
+        LIMIT 1`,
+      [user.uid],
+    );
+    const affiliate = referralRows[0];
+    const paymentNotes: Record<string, string> = {
+      app: 'Sportrz',
+      app_user_id: String(user.uid).slice(0, 256),
+      customer_email: String(user.email || '').slice(0, 256),
+      customer_name: String(user.displayName || '').slice(0, 256),
+      plan_code: String(plan.code).slice(0, 256),
+      plan_name: String(plan.name).slice(0, 256),
+      affiliate_user_id: String(affiliate?.affiliate_user_id || 'none').slice(0, 256),
+      affiliate_code: String(affiliate?.referral_code || 'none').slice(0, 256),
+      affiliate_email: String(affiliate?.affiliate_email || 'none').slice(0, 256),
+      affiliate_name: String(affiliate?.affiliate_name || 'none').slice(0, 256),
+    };
+
+    // Razorpay supports up to 15 note key/value pairs. Keep the full attribution
+    // on the server-created Order and send only the useful checkout notes to the browser.
+    const checkoutNotes: Record<string, string> = {
+      app_user_id: paymentNotes.app_user_id,
+      customer_email: paymentNotes.customer_email,
+      plan_code: paymentNotes.plan_code,
+      affiliate_code: paymentNotes.affiliate_code,
+    };
+    const orderPayload = {
+      amount: amountPaise,
+      currency,
+      receipt: `sp_${Date.now()}`.slice(0, 40),
+      notes: paymentNotes,
+    };
+    const authorization = Buffer.from(`${razorpayKeyId}:${razorpaySecret}`).toString('base64');
+    const response = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: { Authorization: `Basic ${authorization}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(orderPayload),
+    });
+
+    const order = await response.json();
+    if (!response.ok) {
+      console.error('Razorpay order creation failed:', order);
+      return NextResponse.json({ error: 'Razorpay could not create the order.' }, { status: response.status });
+    }
+
+    await getPool().execute(
+      `INSERT INTO payments (user_id, plan_id, provider, order_id, amount_paise, currency, status)
+       VALUES (?, ?, 'razorpay', ?, ?, ?, 'created')`,
+      [user.uid, Number(plan.id), order.id, amountPaise, currency],
+    );
+
+    return NextResponse.json({
+      success: true,
+      order: { id: order.id, amount: order.amount, currency: order.currency, receipt: order.receipt },
+      keyId: razorpayKeyId,
+      plan: { id: plan.code, name: plan.name, durationDays },
+      checkoutNotes,
+    });
+  } catch (error) {
+    console.error('Create order failed:', error);
+    return NextResponse.json({ error: 'Unable to create the payment order.' }, { status: 500 });
+  }
+}
+
+
+========================================
+FILE: .\src\app\api\verify-payment\route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { getPool } from '@/lib/mysql';
+import { getCurrentUser } from '@/lib/session';
+import { getRazorpayConfig } from '@/lib/payment-settings';
+import { ensureAffiliateCommissionForPayment } from '@/lib/affiliate-commission';
+
+export const runtime = 'nodejs';
+
+export async function POST(request: NextRequest) {
+  try {
+    const user = await getCurrentUser();
+    if (!user) return NextResponse.json({ error: 'Sign in before verifying a payment.' }, { status: 401 });
+
+    const body = await request.json();
+    const orderId = String(body.razorpay_order_id || '');
+    const paymentId = String(body.razorpay_payment_id || '');
+    const signature = String(body.razorpay_signature || '');
+    if (!orderId || !paymentId || !signature) {
+      return NextResponse.json({ error: 'Missing required payment details.' }, { status: 400 });
+    }
+
+    const razorpayConfig = await getRazorpayConfig();
+    const razorpayKeyId = razorpayConfig?.keyId;
+    const razorpaySecret = razorpayConfig?.secret;
+    if (!razorpayKeyId || !razorpaySecret) {
+      return NextResponse.json({ error: 'Razorpay credentials are not configured on the server.' }, { status: 500 });
+    }
+
+    const [orderRows] = await getPool().execute<any[]>(
+      `SELECT p.id, p.user_id, p.plan_id, p.amount_paise, p.currency, p.status,
+              p.order_id, p.provider_payment_id, pl.code AS plan_code, pl.duration_days
+       FROM payments p
+       INNER JOIN plans pl ON pl.id = p.plan_id
+       WHERE p.order_id = ? AND p.user_id = ? AND p.provider = 'razorpay'
+       LIMIT 1`,
+      [orderId, user.uid],
+    );
+    const order = orderRows[0];
+    if (!order) return NextResponse.json({ error: 'Payment order not found for this account.' }, { status: 404 });
+
+    // A previous deployment or a transient issue may have captured the payment
+    // before the commission was written. Reconcile idempotently on every retry.
+    if (order.status === 'captured') {
+      const connection = await getPool().getConnection();
+      try {
+        await connection.beginTransaction();
+        await ensureAffiliateCommissionForPayment(connection, Number(order.id));
+        await connection.commit();
+      } catch (error) {
+        await connection.rollback();
+        throw error;
+      } finally {
+        connection.release();
+      }
+      return NextResponse.json({ success: true, message: 'Payment already verified.' });
+    }
+    if (order.status !== 'created' && order.status !== 'authorized') {
+      return NextResponse.json({ error: 'This payment order is not payable.' }, { status: 409 });
+    }
+
+    const expectedSignature = createHmac('sha256', razorpaySecret).update(`${orderId}|${paymentId}`).digest('hex');
+    const expectedBuffer = Buffer.from(expectedSignature, 'hex');
+    const actualBuffer = Buffer.from(signature, 'hex');
+    if (expectedBuffer.length !== actualBuffer.length || !timingSafeEqual(expectedBuffer, actualBuffer)) {
+      return NextResponse.json({ error: 'Payment signature verification failed.' }, { status: 400 });
+    }
+
+    const authorization = Buffer.from(`${razorpayKeyId}:${razorpaySecret}`).toString('base64');
+    const paymentResponse = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(paymentId)}`, {
+      headers: { Authorization: `Basic ${authorization}` },
+    });
+    const paymentData = await paymentResponse.json();
+    if (!paymentResponse.ok) {
+      console.error('Razorpay payment lookup failed:', paymentData);
+      return NextResponse.json({ error: 'Unable to verify payment with Razorpay.' }, { status: 502 });
+    }
+    if (paymentData.order_id !== orderId || paymentData.status !== 'captured' || Number(paymentData.amount) !== Number(order.amount_paise) || paymentData.currency !== order.currency) {
+      return NextResponse.json({ error: 'Payment details do not match the recorded order.' }, { status: 400 });
+    }
+
+    const durationDays = Number(order.duration_days);
+    if (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 3650) {
+      return NextResponse.json({ error: 'The purchased plan duration is invalid.' }, { status: 500 });
+    }
+
+    const pool = getPool();
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [lockedRows] = await connection.execute<any[]>(
+        'SELECT status FROM payments WHERE id = ? AND user_id = ? FOR UPDATE',
+        [order.id, user.uid],
+      );
+      if (!lockedRows.length) throw new Error('Payment order disappeared during verification.');
+      if (lockedRows[0].status === 'captured') {
+        await ensureAffiliateCommissionForPayment(connection, Number(order.id));
+        await connection.commit();
+        return NextResponse.json({ success: true, message: 'Payment already verified.' });
+      }
+
+      await connection.execute(
+        `UPDATE payments
+         SET status = 'captured', provider_payment_id = ?, paid_at = UTC_TIMESTAMP(), provider_payload = ?, updated_at = UTC_TIMESTAMP()
+         WHERE id = ?`,
+        [paymentId, JSON.stringify(paymentData), order.id],
+      );
+      await connection.execute(
+        `UPDATE subscriptions SET status = 'expired', updated_at = UTC_TIMESTAMP()
+         WHERE user_id = ? AND status = 'active' AND end_at IS NOT NULL AND end_at <= UTC_TIMESTAMP()`,
+        [user.uid],
+      );
+      await connection.execute(
+        `UPDATE subscriptions SET status = 'cancelled', updated_at = UTC_TIMESTAMP()
+         WHERE user_id = ? AND status = 'active'`,
+        [user.uid],
+      );
+      await connection.execute(
+        `INSERT INTO subscriptions (user_id, plan_id, payment_record_id, status, source, start_at, end_at)
+         VALUES (?, ?, ?, 'active', 'purchase', UTC_TIMESTAMP(), DATE_ADD(UTC_TIMESTAMP(), INTERVAL ${durationDays} DAY))`,
+        [user.uid, Number(order.plan_id), Number(order.id)],
+      );
+      // Create a commission snapshot using the same idempotent path used by retries.
+      await ensureAffiliateCommissionForPayment(connection, Number(order.id));
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+
+    const [subscriptionRows] = await pool.execute<any[]>(
+      `SELECT start_at, end_at FROM subscriptions
+       WHERE user_id = ? AND payment_record_id = ? ORDER BY id DESC LIMIT 1`,
+      [user.uid, Number(order.id)],
+    );
+    const savedSubscription = subscriptionRows[0];
+    return NextResponse.json({
+      success: true,
+      message: 'Payment verified and subscription activated.',
+      subscription: {
+        plan: order.plan_code,
+        paymentId,
+        orderId,
+        startDate: savedSubscription?.start_at ? new Date(savedSubscription.start_at).toISOString() : new Date().toISOString(),
+        endDate: savedSubscription?.end_at ? new Date(savedSubscription.end_at).toISOString() : new Date(Date.now() + durationDays * 86400000).toISOString(),
+        isActive: true,
+      },
+    });
+  } catch (error) {
+    console.error('Payment verification failed:', error);
+    return NextResponse.json({ error: 'Payment verification failed. Please contact support if money was deducted.' }, { status: 500 });
+  }
+}
+
+
+========================================
+FILE: .\src\app\api\webhooks\razorpay\route.ts
+========================================
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { NextRequest, NextResponse } from 'next/server';
+import { getRazorpayConfig } from '@/lib/payment-settings';
+import { finalizeCapturedRazorpayPayment, PaymentSettlementError } from '@/lib/razorpay-settlement';
+
+export const runtime = 'nodejs';
+
+export async function POST(request: NextRequest) {
+  try {
+    const config = await getRazorpayConfig();
+    if (!config?.keyId || !config.secret || !config.webhookSecret) {
+      return NextResponse.json({ error: 'Razorpay webhook secret is not configured.' }, { status: 503 });
+    }
+
+    const signature = request.headers.get('x-razorpay-signature') || '';
+    if (!/^[a-f0-9]{64}$/i.test(signature)) return NextResponse.json({ error: 'Invalid webhook signature.' }, { status: 400 });
+    const rawBody = await request.text();
+    if (!rawBody || rawBody.length > 1_000_000) return NextResponse.json({ error: 'Invalid webhook payload.' }, { status: 400 });
+    const expected = createHmac('sha256', config.webhookSecret).update(rawBody, 'utf8').digest();
+    const received = Buffer.from(signature, 'hex');
+    if (expected.length !== received.length || !timingSafeEqual(expected, received)) {
+      return NextResponse.json({ error: 'Webhook signature verification failed.' }, { status: 400 });
+    }
+
+    let event: any;
+    try { event = JSON.parse(rawBody); }
+    catch { return NextResponse.json({ error: 'Webhook body must be valid JSON.' }, { status: 400 }); }
+    // Only process the final captured event. Other configured events are acknowledged and ignored.
+    if (event.event !== 'payment.captured') return NextResponse.json({ received: true, ignored: true });
+    const webhookPayment = event?.payload?.payment?.entity;
+    if (!webhookPayment?.id || !webhookPayment?.order_id || webhookPayment.status !== 'captured') {
+      return NextResponse.json({ error: 'The captured payment entity is missing required fields.' }, { status: 400 });
+    }
+
+    // Re-fetch the payment from Razorpay after authenticating the webhook, then reconcile the exact order, currency and amount.
+    const authorization = Buffer.from(`${config.keyId}:${config.secret}`).toString('base64');
+    const providerResponse = await fetch(`https://api.razorpay.com/v1/payments/${encodeURIComponent(String(webhookPayment.id))}`, {
+      headers: { Authorization: `Basic ${authorization}` }, cache: 'no-store',
+    });
+    const payment = await providerResponse.json();
+    if (!providerResponse.ok) {
+      console.error('Razorpay webhook payment lookup failed:', { status: providerResponse.status, paymentId: webhookPayment.id, response: payment });
+      return NextResponse.json({ error: 'Could not reconcile this payment with Razorpay. The provider may retry the webhook.' }, { status: 502 });
+    }
+    if (payment.id !== webhookPayment.id || payment.order_id !== webhookPayment.order_id || payment.status !== 'captured') {
+      return NextResponse.json({ error: 'The provider payment does not match the webhook event.' }, { status: 409 });
+    }
+
+    const result = await finalizeCapturedRazorpayPayment({
+      orderId: String(payment.order_id), paymentId: String(payment.id), amount: Number(payment.amount), currency: String(payment.currency),
+      status: String(payment.status), rawPayload: payment,
+    });
+    return NextResponse.json({ received: true, reconciled: true, alreadyApplied: result.alreadyApplied });
+  } catch (error) {
+    if (error instanceof PaymentSettlementError) return NextResponse.json({ error: error.message }, { status: error.status });
+    console.error('Razorpay webhook processing failed:', error);
+    return NextResponse.json({ error: 'Webhook processing failed. The provider may retry the event.' }, { status: 500 });
+  }
+}
+
+
+========================================
+FILE: .\src\lib\mysql.ts
+========================================
+import mysql, { type Pool, type PoolOptions } from 'mysql2/promise';
+
+type DatabaseGlobals = typeof globalThis & { __sportrzMysqlPool?: Pool };
+const globals = globalThis as DatabaseGlobals;
+
+function getDatabaseOptions(): PoolOptions {
+  const databaseUrl = process.env.DATABASE_URL;
+
+  if (databaseUrl) {
+    const parsed = new URL(databaseUrl);
+    const options: PoolOptions = {
+      host: parsed.hostname,
+      port: parsed.port ? Number(parsed.port) : 3306,
+      user: decodeURIComponent(parsed.username),
+      password: decodeURIComponent(parsed.password),
+      database: parsed.pathname.replace(/^\//, ''),
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+      decimalNumbers: true,
+      timezone: 'Z',
+      enableKeepAlive: true,
+    };
+
+    if (parsed.searchParams.get('ssl') === 'true') {
+      options.ssl = { rejectUnauthorized: true };
+    }
+
+    return options;
+  }
+
+  const host = process.env.MYSQL_HOST;
+  const user = process.env.MYSQL_USER;
+  const database = process.env.MYSQL_DATABASE;
+  if (!host || !user || !database) {
+    throw new Error(
+      'MySQL is not configured. Set DATABASE_URL or MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE, and MYSQL_PORT in .env.local.'
+    );
+  }
+
+  return {
+    host,
+    port: Number(process.env.MYSQL_PORT || 3306),
+    user,
+    password: process.env.MYSQL_PASSWORD || '',
+    database,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    decimalNumbers: true,
+    timezone: 'Z',
+    enableKeepAlive: true,
+    ...(process.env.MYSQL_SSL === 'true' ? { ssl: { rejectUnauthorized: true } } : {}),
+  };
+}
+
+export function getPool(): Pool {
+  if (!globals.__sportrzMysqlPool) {
+    globals.__sportrzMysqlPool = mysql.createPool(getDatabaseOptions());
+  }
+  return globals.__sportrzMysqlPool;
+}
+
+export async function checkDatabaseConnection(): Promise<void> {
+  const connection = await getPool().getConnection();
+  try {
+    await connection.ping();
+  } finally {
+    connection.release();
+  }
+}
+
+export function parseJson<T>(value: unknown, fallback: T): T {
+  if (value == null) return fallback;
+  if (typeof value !== 'string') return value as T;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+
+========================================
+FILE: .\src\lib\razorpay.ts
+========================================
+// src/lib/razorpay.ts
+declare global {
+  interface Window {
+    Razorpay: any;
+  }
+}
+
+interface RazorpayOptions {
+  key: string;
+  amount: number;
+  currency: string;
+  name: string;
+  description: string;
+  order_id: string;
+  handler: (response: RazorpayResponse) => void;
+  prefill?: {
+    name?: string;
+    email?: string;
+    contact?: string;
+  };
+  notes?: Record<string, string>;
+  theme?: {
+    color?: string;
+    backdrop_color?: string;
+  };
+  modal?: {
+    backdropclose?: boolean;
+    escape?: boolean;
+    handleback?: boolean;
+    ondismiss?: () => void;
+  };
+}
+
+interface RazorpayResponse {
+  razorpay_payment_id: string;
+  razorpay_order_id: string;
+  razorpay_signature: string;
+}
+
+export const loadRazorpayScript = (): Promise<boolean> => {
+  return new Promise((resolve) => {
+    // Check if script is already loaded
+    if (window.Razorpay) {
+      resolve(true);
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = 'https://checkout.razorpay.com/v1/checkout.js';
+    script.onload = () => resolve(true);
+    script.onerror = () => resolve(false);
+    document.body.appendChild(script);
+  });
+};
+
+export const initiateRazorpayPayment = async (
+  options: RazorpayOptions
+): Promise<void> => {
+  const isScriptLoaded = await loadRazorpayScript();
+  
+  if (!isScriptLoaded) {
+    throw new Error('Failed to load Razorpay script');
+  }
+
+  const razorpay = new window.Razorpay(options);
+  razorpay.open();
+};
+
+export const createRazorpayOrder = async (planId: string) => {
+  const response = await fetch('/api/create-order', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ planId }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Failed to create order');
+  return data;
+};
+
+export const verifyRazorpayPayment = async (
+  razorpay_order_id: string,
+  razorpay_payment_id: string,
+  razorpay_signature: string,
+) => {
+  const response = await fetch('/api/verify-payment', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ razorpay_order_id, razorpay_payment_id, razorpay_signature }),
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Payment verification failed');
+  return data;
+};
+
+
+========================================
+FILE: .\src\lib\razorpay-settlement.ts
+========================================
+import type { RowDataPacket } from 'mysql2/promise';
+import { getPool } from '@/lib/mysql';
+
+export class PaymentSettlementError extends Error {
+  status: number;
+  constructor(message: string, status = 400) { super(message); this.name = 'PaymentSettlementError'; this.status = status; }
+}
+
+export interface CapturedRazorpayPayment {
+  orderId: string;
+  paymentId: string;
+  amount: number;
+  currency: string;
+  status: string;
+  rawPayload: unknown;
+  expectedUserId?: string;
+}
+
+export async function finalizeCapturedRazorpayPayment(input: CapturedRazorpayPayment) {
+  const pool = getPool();
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const query = `SELECT p.id, p.user_id, p.plan_id, p.amount_paise, p.currency, p.status, p.provider_payment_id,
+                          pl.code AS plan_code, pl.duration_days
+                   FROM payments p JOIN plans pl ON pl.id = p.plan_id
+                   WHERE p.order_id = ? AND p.provider = 'razorpay' ${input.expectedUserId ? 'AND p.user_id = ?' : ''}
+                   LIMIT 1 FOR UPDATE`;
+    const args = input.expectedUserId ? [input.orderId, input.expectedUserId] : [input.orderId];
+    const [orders] = await connection.execute<Array<RowDataPacket & {
+      id: number; user_id: string; plan_id: number; amount_paise: number; currency: string; status: string;
+      provider_payment_id: string | null; plan_code: string; duration_days: number | null;
+    }>>(query, args);
+    const order = orders[0];
+    if (!order) throw new PaymentSettlementError('Payment order not found.', 404);
+    if (input.status !== 'captured' || input.orderId.length === 0 || input.paymentId.length === 0) throw new PaymentSettlementError('Payment is not captured.');
+    if (input.amount !== Number(order.amount_paise) || input.currency !== order.currency) throw new PaymentSettlementError('Payment amount or currency does not match the order.');
+    if (order.provider_payment_id && order.provider_payment_id !== input.paymentId) throw new PaymentSettlementError('A different payment is already attached to this order.', 409);
+    if (!['created', 'authorized', 'captured'].includes(order.status)) throw new PaymentSettlementError('This order is not payable.', 409);
+
+    const durationDays = order.duration_days == null ? null : Number(order.duration_days);
+    if (durationDays !== null && (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 3650)) throw new PaymentSettlementError('The purchased plan duration is invalid.', 500);
+
+    if (order.status !== 'captured' || !order.provider_payment_id) {
+      await connection.execute(
+        `UPDATE payments SET status = 'captured', provider_payment_id = ?, paid_at = UTC_TIMESTAMP(), provider_payload = ?, updated_at = UTC_TIMESTAMP() WHERE id = ?`,
+        [input.paymentId, JSON.stringify(input.rawPayload), order.id],
+      );
+    }
+
+    const [existingSubscriptionRows] = await connection.execute<Array<RowDataPacket & { id: number; start_at: Date | string | null; end_at: Date | string | null }>>(
+      'SELECT id, start_at, end_at FROM subscriptions WHERE payment_record_id = ? ORDER BY id DESC LIMIT 1 FOR UPDATE', [order.id],
+    );
+    let savedSubscription = existingSubscriptionRows[0];
+    if (!savedSubscription) {
+      await connection.execute(
+        `UPDATE subscriptions SET status = 'expired', updated_at = UTC_TIMESTAMP()
+         WHERE user_id = ? AND status = 'active' AND end_at IS NOT NULL AND end_at <= UTC_TIMESTAMP()`, [order.user_id],
+      );
+      await connection.execute(
+        `UPDATE subscriptions SET status = 'cancelled', updated_at = UTC_TIMESTAMP() WHERE user_id = ? AND status = 'active'`, [order.user_id],
+      );
+      await connection.execute(
+        `INSERT INTO subscriptions (user_id, plan_id, payment_record_id, status, source, start_at, end_at)
+         VALUES (?, ?, ?, 'active', 'purchase', UTC_TIMESTAMP(), ${durationDays === null ? 'NULL' : 'DATE_ADD(UTC_TIMESTAMP(), INTERVAL ? DAY)'})`,
+        durationDays === null ? [order.user_id, Number(order.plan_id), Number(order.id)] : [order.user_id, Number(order.plan_id), Number(order.id), durationDays],
+      );
+      const [newRows] = await connection.execute<Array<RowDataPacket & { id: number; start_at: Date | string | null; end_at: Date | string | null }>>(
+        'SELECT id, start_at, end_at FROM subscriptions WHERE payment_record_id = ? ORDER BY id DESC LIMIT 1', [order.id],
+      );
+      savedSubscription = newRows[0];
+    }
+
+    // This is idempotent per payment_record_id. The stored percentage is a snapshot of the profile rate at capture time.
+    await connection.execute(
+      `INSERT IGNORE INTO affiliate_commissions (affiliate_user_id, referred_user_id, payment_record_id, amount_paise, commission_percent, commission_paise, status)
+       SELECT ar.affiliate_user_id, ar.referred_user_id, p.id, p.amount_paise, ap.commission_percent,
+              FLOOR(p.amount_paise * ap.commission_percent / 100), 'pending'
+       FROM payments p
+       JOIN affiliate_referrals ar ON ar.referred_user_id = p.user_id AND ar.status = 'qualified' AND COALESCE(p.paid_at, p.created_at) >= ar.created_at
+       JOIN affiliate_profiles ap ON ap.user_id = ar.affiliate_user_id AND ap.status = 'active'
+       JOIN users au ON au.id = ap.user_id AND au.account_role = 'affiliate' AND au.status = 'active'
+       WHERE p.id = ? LIMIT 1`, [Number(order.id)],
+    );
+
+    await connection.commit();
+    const toIso = (value: Date | string | null | undefined): string | null => {
+      if (!value) return null;
+      return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+    };
+    return {
+      alreadyApplied: Boolean(existingSubscriptionRows[0]),
+      userId: order.user_id,
+      planCode: order.plan_code,
+      paymentId: input.paymentId,
+      orderId: input.orderId,
+      subscription: {
+        startDate: toIso(savedSubscription?.start_at) || new Date().toISOString(),
+        endDate: toIso(savedSubscription?.end_at),
+        isActive: true,
+      },
+    };
+  } catch (error) {
+    try { await connection.rollback(); } catch { /* Ignore rollback after a failed transaction/commit. */ }
+    throw error;
+  } finally { connection.release(); }
+}
+
+
+========================================
+FILE: .\src\lib\session.ts
+========================================
+import { cookies } from 'next/headers';
+import type { NextResponse } from 'next/server';
+import { createHmac, randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
+import { promisify } from 'node:util';
+import type { RowDataPacket } from 'mysql2/promise';
+import { getPool } from '@/lib/mysql';
+
+const scrypt = promisify(scryptCallback);
+export const SESSION_COOKIE = 'sportrz_session';
+const SESSION_LIFETIME_SECONDS = 60 * 60 * 24 * 30;
+
+export interface AppUser {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL: string | null;
+  emailVerified: boolean;
+  isAdmin: boolean;
+  accountRole: 'user' | 'super_admin' | 'subadmin' | 'affiliate';
+  isAffiliate: boolean;
+  avatar: string;
+  hasReceivedWelcomeNotification: boolean;
+}
+
+interface UserRow extends RowDataPacket {
+  id: string;
+  email: string;
+  display_name: string | null;
+  photo_url: string | null;
+  email_verified_at: Date | string | null;
+  status: 'active' | 'suspended';
+  is_admin: number | boolean;
+  account_role: 'user' | 'super_admin' | 'subadmin' | 'affiliate';
+  avatar: string | null;
+  has_received_welcome_notification: number | boolean;
+}
+
+function getSessionSecret(): string {
+  const secret = process.env.AUTH_SECRET;
+  if (secret) return secret;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('AUTH_SECRET must be configured in production.');
+  }
+  return 'local-development-secret-change-before-deployment';
+}
+
+function signSessionPayload(payload: string): string {
+  return createHmac('sha256', getSessionSecret()).update(payload).digest('base64url');
+}
+
+export function createSessionToken(userId: string): string {
+  const expiresAt = Math.floor(Date.now() / 1000) + SESSION_LIFETIME_SECONDS;
+  const payload = `${userId}.${expiresAt}`;
+  return `${payload}.${signSessionPayload(payload)}`;
+}
+
+function readSessionToken(token: string | undefined): string | null {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+
+  const [userId, expiresRaw, signature] = parts;
+  const expiresAt = Number(expiresRaw);
+  if (!userId || !Number.isFinite(expiresAt) || expiresAt <= Math.floor(Date.now() / 1000)) return null;
+
+  const payload = `${userId}.${expiresRaw}`;
+  const expected = Buffer.from(signSessionPayload(payload));
+  const actual = Buffer.from(signature);
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) return null;
+  return userId;
+}
+
+export function setSessionCookie(response: NextResponse, userId: string): void {
+  response.cookies.set(SESSION_COOKIE, createSessionToken(userId), {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: SESSION_LIFETIME_SECONDS,
+  });
+}
+
+export function clearSessionCookie(response: NextResponse): void {
+  response.cookies.set(SESSION_COOKIE, '', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 0,
+  });
+}
+
+export async function getCurrentUser(): Promise<AppUser | null> {
+  const cookieStore = await cookies();
+  const userId = readSessionToken(cookieStore.get(SESSION_COOKIE)?.value);
+  if (!userId) return null;
+
+  const [rows] = await getPool().execute<UserRow[]>(
+    `SELECT id, email, display_name, photo_url, email_verified_at, status, is_admin, account_role,
+            avatar, has_received_welcome_notification
+       FROM users WHERE id = ? LIMIT 1`,
+    [userId],
+  );
+  if (!rows.length || rows[0].status !== 'active') return null;
+
+  const user = rows[0];
+  return {
+    uid: user.id,
+    email: user.email,
+    displayName: user.display_name || user.email.split('@')[0],
+    photoURL: user.photo_url,
+    emailVerified: Boolean(user.email_verified_at),
+    isAdmin: Boolean(user.is_admin),
+    accountRole: user.account_role,
+    isAffiliate: user.account_role === 'affiliate',
+    avatar: user.avatar || 'avatar1',
+    hasReceivedWelcomeNotification: Boolean(user.has_received_welcome_notification),
+  };
+}
+
+export async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16).toString('hex');
+  const derivedKey = (await scrypt(password, salt, 64)) as Buffer;
+  return `scrypt$${salt}$${derivedKey.toString('hex')}`;
+}
+
+export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
+  const [algorithm, salt, expectedHex] = storedHash.split('$');
+  if (algorithm !== 'scrypt' || !salt || !expectedHex) return false;
+
+  const expected = Buffer.from(expectedHex, 'hex');
+  const actual = (await scrypt(password, salt, expected.length)) as Buffer;
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+}
+
+export function generateOneTimeToken(): string {
+  return randomBytes(32).toString('base64url');
+}
+
+export function hashOneTimeToken(token: string): string {
+  return createHmac('sha256', getSessionSecret()).update(token).digest('hex');
+}
+
+
+========================================
+FILE: D:\next.js\sportrz\database\migrations\20261028_admin_affiliate_portal.sql
+========================================
+-- Sportrz admin, sub-admin, and affiliate portal extensions.
+-- Run once against the existing astrotri_sportrz database before using the new admin APIs.
+
+ALTER TABLE users
+  ADD COLUMN IF NOT EXISTS account_role ENUM('user','super_admin','subadmin','affiliate') NOT NULL DEFAULT 'user';
+
+UPDATE users
+   SET account_role = 'super_admin'
+ WHERE is_admin = 1 AND account_role = 'user';
+
+ALTER TABLE subscriptions
+  ADD COLUMN IF NOT EXISTS assigned_by_admin_id CHAR(36) DEFAULT NULL;
+
+ALTER TABLE subscriptions
+  ADD COLUMN IF NOT EXISTS updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+
+ALTER TABLE subscriptions
+  MODIFY COLUMN source VARCHAR(32) NOT NULL DEFAULT 'purchase';
+
+ALTER TABLE payments
+  ADD COLUMN IF NOT EXISTS updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS admin_user_permissions (
+  user_id CHAR(36) NOT NULL,
+  permission_key VARCHAR(80) NOT NULL,
+  granted_by_user_id CHAR(36) DEFAULT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, permission_key),
+  KEY idx_admin_permissions_key (permission_key),
+  CONSTRAINT fk_admin_permissions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_admin_permissions_granted_by FOREIGN KEY (granted_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS affiliate_profiles (
+  user_id CHAR(36) NOT NULL,
+  referral_code VARCHAR(32) NOT NULL,
+  commission_percent DECIMAL(5,2) NOT NULL DEFAULT 10.00,
+  payout_email VARCHAR(191) DEFAULT NULL,
+  status ENUM('active','paused') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id),
+  UNIQUE KEY uq_affiliate_referral_code (referral_code),
+  KEY idx_affiliate_status_created (status, created_at),
+  CONSTRAINT fk_affiliate_profile_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS affiliate_referrals (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  affiliate_user_id CHAR(36) NOT NULL,
+  referred_user_id CHAR(36) NOT NULL,
+  referral_code VARCHAR(32) NOT NULL,
+  source ENUM('link','manual') NOT NULL DEFAULT 'link',
+  status ENUM('qualified','rejected') NOT NULL DEFAULT 'qualified',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_affiliate_referred_user (referred_user_id),
+  KEY idx_affiliate_referrals_affiliate_created (affiliate_user_id, created_at),
+  CONSTRAINT fk_affiliate_referrals_affiliate FOREIGN KEY (affiliate_user_id) REFERENCES affiliate_profiles(user_id) ON DELETE CASCADE,
+  CONSTRAINT fk_affiliate_referrals_referred FOREIGN KEY (referred_user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS affiliate_commissions (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  affiliate_user_id CHAR(36) NOT NULL,
+  referred_user_id CHAR(36) NOT NULL,
+  payment_record_id BIGINT UNSIGNED NOT NULL,
+  amount_paise BIGINT UNSIGNED NOT NULL,
+  commission_percent DECIMAL(5,2) NOT NULL,
+  commission_paise BIGINT UNSIGNED NOT NULL,
+  status ENUM('pending','approved','paid','reversed') NOT NULL DEFAULT 'pending',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_affiliate_commission_payment (payment_record_id),
+  KEY idx_affiliate_commissions_affiliate_status (affiliate_user_id, status),
+  CONSTRAINT fk_affiliate_commission_affiliate FOREIGN KEY (affiliate_user_id) REFERENCES affiliate_profiles(user_id) ON DELETE CASCADE,
+  CONSTRAINT fk_affiliate_commission_referred FOREIGN KEY (referred_user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_affiliate_commission_payment FOREIGN KEY (payment_record_id) REFERENCES payments(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO site_settings (setting_key, setting_value, value_type)
+VALUES
+  ('site_name', 'Sportrz', 'string'),
+  ('support_email', 'support@backend.sportrz.com', 'string'),
+  ('maintenance_mode', 'false', 'boolean'),
+  ('registration_enabled', 'true', 'boolean')
+ON DUPLICATE KEY UPDATE setting_key = VALUES(setting_key);
+
+-- Do not enable paid plans automatically. The super admin should review prices and activate them in Admin > Plans.
+
+
+========================================
+FILE: D:\next.js\sportrz\database\migrations\20261029_external_affiliate_program.sql
+========================================
+-- External website affiliate support. Safe to re-run on MariaDB 10.4+ / MySQL 8.
+ALTER TABLE affiliate_profiles
+  ADD COLUMN IF NOT EXISTS affiliate_type ENUM('admin_created','external_website') NOT NULL DEFAULT 'admin_created',
+  ADD COLUMN IF NOT EXISTS website_url VARCHAR(512) DEFAULT NULL;
+
+CREATE TABLE IF NOT EXISTS affiliate_applications (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  user_id CHAR(36) NOT NULL,
+  website_url VARCHAR(512) NOT NULL,
+  status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+  review_note VARCHAR(512) DEFAULT NULL,
+  reviewed_by_admin_id CHAR(36) DEFAULT NULL,
+  reviewed_at DATETIME DEFAULT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_affiliate_applications_user (user_id),
+  KEY idx_affiliate_applications_status_created (status, created_at),
+  CONSTRAINT fk_affiliate_applications_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_affiliate_applications_reviewer FOREIGN KEY (reviewed_by_admin_id) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+========================================
+FILE: D:\next.js\sportrz\src\app\affiliate\apply\page.tsx
+========================================
+'use client';
+
+import { FormEvent, useEffect, useState } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { ArrowRight, CheckCircle2, ExternalLink, Globe, LoaderCircle, ShieldCheck } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
+
+type ApplicationState = { state: string; application?: { website_url: string; status: string; review_note?: string | null }; profile?: { referralUrl: string; commission_percent: number; status: string; affiliate_type: string; website_url: string | null } };
+
+export default function AffiliateApplyPage() {
+  const router = useRouter();
+  const { currentUser, loading: authLoading } = useAuth();
+  const [websiteUrl, setWebsiteUrl] = useState('');
+  const [state, setState] = useState<ApplicationState | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+
+  useEffect(() => {
+    if (authLoading) return;
+    if (!currentUser) {
+      router.replace('/login?next=%2Faffiliate%2Fapply');
+      return;
+    }
+    let alive = true;
+    fetch('/api/affiliate/apply', { cache: 'no-store' }).then(async (response) => {
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not load application status.');
+      if (!alive) return;
+      setState(data);
+      setWebsiteUrl(data.application?.website_url || '');
+    }).catch((err) => { if (alive) setError(err instanceof Error ? err.message : 'Unable to load the application.'); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [authLoading, currentUser, router]);
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (saving) return;
+    setSaving(true); setError(''); setSuccess('');
+    try {
+      const response = await fetch('/api/affiliate/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ websiteUrl }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Application could not be submitted.');
+      setState({ state: 'pending', application: { website_url: websiteUrl, status: 'pending' } });
+      setSuccess(data.message || 'Application submitted for review.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Application could not be submitted.');
+    } finally { setSaving(false); }
+  };
+
+  if (authLoading || loading) return <main className="flex min-h-[65vh] items-center justify-center"><div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm text-slate-600 shadow-sm"><LoaderCircle className="h-5 w-5 animate-spin text-orange-600"/>Loading affiliate application…</div></main>;
+
+  return <main className="min-h-[70vh] bg-gradient-to-b from-orange-50 to-white px-4 py-12 dark:from-slate-950 dark:to-slate-900">
+    <section className="mx-auto max-w-3xl overflow-hidden rounded-3xl border border-orange-100 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900">
+      <div className="bg-gradient-to-r from-orange-600 to-rose-600 px-7 py-8 text-white sm:px-10"><div className="mb-3 inline-flex rounded-full bg-white/15 px-3 py-1 text-xs font-semibold"><Globe className="mr-2 h-4 w-4"/> Sportrz Partner Program</div><h1 className="text-3xl font-black">Earn by referring players</h1><p className="mt-2 max-w-xl text-sm leading-6 text-white/85">Apply with your website. After approval, you'll receive a unique tracking link and earn commission on eligible paid plans bought by your referred users.</p></div>
+      <div className="space-y-5 p-6 sm:p-10">
+        {!currentUser ? <p className="text-sm text-slate-600">Please sign in with email OTP first.</p> : null}
+        {state?.state === 'affiliate' && state.profile ? <div className="space-y-4"><div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-emerald-900"><div className="flex items-center gap-2 font-bold"><CheckCircle2 className="h-5 w-5"/>Your affiliate account is active</div><p className="mt-1 text-sm">Commission rate: {state.profile.commission_percent}% · Status: {state.profile.status}</p></div><label className="block text-sm font-semibold">Your referral link</label><div className="break-all rounded-xl bg-slate-100 p-3 text-sm text-slate-800">{state.profile.referralUrl}</div><p className="text-sm leading-6 text-slate-600">Add this exact link to a button or banner on your website. The submitted website address is for review; sales attribution comes from the unique referral link.</p><Link className="inline-flex items-center gap-2 rounded-xl bg-orange-600 px-4 py-3 font-semibold text-white" href="/admin">Open affiliate dashboard <ArrowRight className="h-4 w-4"/></Link></div>
+        : state?.state === 'pending' ? <div className="space-y-3"><div className="rounded-2xl border border-amber-200 bg-amber-50 p-4"><div className="font-bold text-amber-900">Application pending review</div><p className="mt-1 text-sm text-amber-800">Website: {state.application?.website_url}</p><p className="mt-2 text-sm text-amber-800">Your referral profile becomes active only after an admin approves the application.</p></div><p className="text-sm text-slate-600">You can update the website URL below and resubmit it for review.</p><form className="space-y-4" onSubmit={submit}><label className="block text-sm font-semibold text-slate-700">Your website URL<input required type="url" maxLength={512} value={websiteUrl} onChange={(e) => setWebsiteUrl(e.target.value)} placeholder="https://yourwebsite.com" className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-orange-500 focus:ring-4 focus:ring-orange-100"/></label>{error && <p role="alert" className="text-sm text-rose-700">{error}</p>}{success && <p role="status" className="text-sm text-emerald-700">{success}</p>}<button disabled={saving} className="inline-flex items-center gap-2 rounded-xl bg-orange-600 px-4 py-3 font-semibold text-white disabled:opacity-50">{saving && <LoaderCircle className="h-4 w-4 animate-spin"/>}Update application</button></form></div>
+        : state?.state === 'not_eligible' ? <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-900">This account cannot apply for an affiliate profile. Contact Sportrz support if you believe this is an error.</div>
+        : <><div className="grid gap-3 sm:grid-cols-3">{[{icon:<Globe className="h-5 w-5"/>,title:'Submit your site',desc:'Share the website you own or manage.'},{icon:<ShieldCheck className="h-5 w-5"/>,title:'Admin approval',desc:'Your site and application are reviewed.'},{icon:<ExternalLink className="h-5 w-5"/>,title:'Track referrals',desc:'Use your unique referral link for attribution.'}].map((item) => <div key={item.title} className="rounded-2xl border border-slate-200 p-4"><div className="mb-2 text-orange-600">{item.icon}</div><div className="font-bold text-slate-900">{item.title}</div><p className="mt-1 text-xs leading-5 text-slate-500">{item.desc}</p></div>)}</div><form className="space-y-4" onSubmit={submit}><label className="block text-sm font-semibold text-slate-700">Website URL<input required type="url" maxLength={512} value={websiteUrl} onChange={(e) => setWebsiteUrl(e.target.value)} placeholder="https://yourwebsite.com" className="mt-2 w-full rounded-xl border border-slate-200 px-4 py-3 outline-none focus:border-orange-500 focus:ring-4 focus:ring-orange-100"/></label><p className="text-xs leading-5 text-slate-500">Use a website you own or are authorized to promote from. After approval, place the referral link we issue on that website. The website URL alone does not track sales.</p>{error && <p role="alert" className="text-sm text-rose-700">{error}</p>}{success && <p role="status" className="text-sm text-emerald-700">{success}</p>}<button disabled={saving} className="inline-flex items-center gap-2 rounded-xl bg-orange-600 px-5 py-3 font-semibold text-white disabled:opacity-50">{saving ? <LoaderCircle className="h-4 w-4 animate-spin"/> : null}Submit for approval <ArrowRight className="h-4 w-4"/></button></form></>}
+      </div>
+    </section>
+  </main>;
+}
+
+
+========================================
+FILE: D:\next.js\sportrz\src\app\api\admin\affiliates\route.ts
+========================================
+import { randomBytes } from 'node:crypto';
+import { NextRequest, NextResponse } from 'next/server';
+import type { RowDataPacket } from 'mysql2/promise';
+import { getPool } from '@/lib/mysql';
+import { getAdminPrincipal, hasPermission } from '@/lib/admin-access';
+import { logAdminAction } from '@/lib/admin-audit';
+
+export const runtime = 'nodejs';
+const appOrigin = () => { const configured = process.env.NEXT_PUBLIC_APP_URL; const fallback = process.env.NODE_ENV === 'production' ? 'https://sportrz.com' : 'http://localhost:3000'; const candidate = configured && !/^https?:\/\/localhost(?::\d+)?$/i.test(configured) ? configured : fallback; return candidate.replace(/\/$/, ''); };
+const makeReferralCode = () => `SP-${randomBytes(5).toString('hex').toUpperCase()}`;
+
+async function uniqueReferralCode(executor: { execute: Function }): Promise<string> {
+  for (let i = 0; i < 10; i++) {
+    const code = makeReferralCode();
+    const [rows] = await executor.execute('SELECT user_id FROM affiliate_profiles WHERE referral_code = ? LIMIT 1', [code]);
+    if (!(rows as unknown[]).length) return code;
+  }
+  throw new Error('Unable to generate a unique affiliate referral code.');
+}
+
+export async function GET() {
+  try {
+    const actor = await getAdminPrincipal();
+    if (!actor || (!actor.isAffiliate && !hasPermission(actor, 'affiliates.view'))) return NextResponse.json({ error: 'Affiliate access required.' }, { status: 403 });
+    const pool = getPool();
+
+    // Affiliate views are deliberately scoped by the authenticated session user ID.
+    if (actor.isAffiliate) {
+      const [profileRows] = await pool.execute<Array<RowDataPacket & { referral_code: string; commission_percent: number; status: string; payout_email: string | null; affiliate_type: string; website_url: string | null }>>(
+        "SELECT ap.referral_code, ap.commission_percent, ap.status, ap.payout_email, ap.affiliate_type, ap.website_url FROM affiliate_profiles ap JOIN users u ON u.id = ap.user_id WHERE ap.user_id = ? AND u.account_role = 'affiliate' LIMIT 1", [actor.id],
+      );
+      const profile = profileRows[0];
+      if (!profile) return NextResponse.json({ affiliate: null, referrals: [], commissions: [], scope: 'own-referrals-only' });
+      const [referrals] = await pool.execute<Array<RowDataPacket & { id: string; email: string; display_name: string | null; created_at: Date | string; active_subscription: string | null; captured_payments: number }>>(
+        `SELECT u.id, u.email, u.display_name, ar.created_at,
+          (SELECT pl.code FROM subscriptions s JOIN plans pl ON pl.id = s.plan_id WHERE s.user_id = u.id AND s.status = 'active' AND (s.end_at IS NULL OR s.end_at > UTC_TIMESTAMP()) ORDER BY s.end_at DESC LIMIT 1) AS active_subscription,
+          (SELECT COUNT(*) FROM payments p WHERE p.user_id = u.id AND p.status = 'captured' AND COALESCE(p.paid_at, p.created_at) >= ar.created_at) AS captured_payments
+         FROM affiliate_referrals ar JOIN users u ON u.id = ar.referred_user_id
+         WHERE ar.affiliate_user_id = ? AND ar.status = 'qualified'
+         ORDER BY ar.created_at DESC`, [actor.id],
+      );
+      const [revenueRows] = await pool.execute<Array<RowDataPacket & { user_id: string; currency: string; amount_paise: number }>>(
+        `SELECT ar.referred_user_id AS user_id, p.currency, SUM(p.amount_paise) AS amount_paise
+         FROM affiliate_referrals ar JOIN payments p ON p.user_id = ar.referred_user_id AND p.status = 'captured'
+         WHERE ar.affiliate_user_id = ? AND ar.status = 'qualified' AND COALESCE(p.paid_at, p.created_at) >= ar.created_at
+         GROUP BY ar.referred_user_id, p.currency`, [actor.id],
+      );
+      const revenueMap = new Map<string, Array<{ currency: string; amount: number }>>();
+      for (const row of revenueRows) {
+        const values = revenueMap.get(row.user_id) || [];
+        values.push({ currency: row.currency || 'INR', amount: Number(row.amount_paise || 0) / 100 });
+        revenueMap.set(row.user_id, values);
+      }
+      const [commissionRows] = await pool.execute<Array<RowDataPacket & { status: string; currency: string; total_paise: number; count: number }>>(
+        `SELECT ac.status, p.currency, SUM(ac.commission_paise) AS total_paise, COUNT(*) AS count
+         FROM affiliate_commissions ac JOIN payments p ON p.id = ac.payment_record_id
+         WHERE ac.affiliate_user_id = ? GROUP BY ac.status, p.currency ORDER BY ac.status, p.currency`, [actor.id],
+      );
+      const origin = appOrigin();
+      return NextResponse.json({
+        affiliate: { ...profile, commission_percent: Number(profile.commission_percent), referral_url: `${origin}/login?ref=${encodeURIComponent(profile.referral_code)}` },
+        referrals: referrals.map((r) => ({ id: r.id, email: r.email, displayName: r.display_name || '', referredAt: r.created_at, activeSubscription: r.active_subscription, capturedPayments: Number(r.captured_payments || 0), revenueByCurrency: revenueMap.get(r.id) || [] })),
+        commissions: commissionRows.map((r) => ({ status: r.status, currency: r.currency || 'INR', amount: Number(r.total_paise || 0) / 100, count: Number(r.count || 0) })),
+        scope: 'own-referrals-only',
+      }, { headers: { 'Cache-Control': 'no-store' } });
+    }
+
+    const [rows] = await pool.query<Array<RowDataPacket & { user_id: string; email: string; display_name: string | null; referral_code: string; commission_percent: number; affiliate_status: string; affiliate_type: string; website_url: string | null; created_at: Date | string; referral_count: number; converted_count: number }>>(
+      `SELECT u.id AS user_id, u.email, u.display_name, ap.referral_code, ap.commission_percent,
+        ap.status AS affiliate_status, ap.affiliate_type, ap.website_url, ap.created_at,
+        (SELECT COUNT(*) FROM affiliate_referrals ar WHERE ar.affiliate_user_id = ap.user_id AND ar.status = 'qualified') AS referral_count,
+        (SELECT COUNT(DISTINCT ar.referred_user_id) FROM affiliate_referrals ar JOIN payments p ON p.user_id = ar.referred_user_id AND p.status = 'captured' WHERE ar.affiliate_user_id = ap.user_id AND ar.status = 'qualified' AND COALESCE(p.paid_at, p.created_at) >= ar.created_at) AS converted_count
+       FROM affiliate_profiles ap JOIN users u ON u.id = ap.user_id WHERE u.account_role = 'affiliate' ORDER BY ap.created_at DESC`,
+    );
+    const [totals] = await pool.query<Array<RowDataPacket & { affiliate_user_id: string; currency: string; total_paise: number; pending_paise: number }>>(
+      `SELECT ac.affiliate_user_id, p.currency,
+        SUM(CASE WHEN ac.status <> 'reversed' THEN ac.commission_paise ELSE 0 END) AS total_paise,
+        SUM(CASE WHEN ac.status IN ('pending','approved') THEN ac.commission_paise ELSE 0 END) AS pending_paise
+       FROM affiliate_commissions ac JOIN payments p ON p.id = ac.payment_record_id
+       GROUP BY ac.affiliate_user_id, p.currency`,
+    );
+    const totalsMap = new Map<string, Array<{ currency: string; total: number; pending: number }>>();
+    for (const row of totals) {
+      const values = totalsMap.get(row.affiliate_user_id) || [];
+      values.push({ currency: row.currency || 'INR', total: Number(row.total_paise || 0) / 100, pending: Number(row.pending_paise || 0) / 100 });
+      totalsMap.set(row.affiliate_user_id, values);
+    }
+    const [ledgerRows] = await pool.query<Array<RowDataPacket & { id: number; affiliate_email: string; affiliate_name: string | null; referred_email: string; amount_paise: number; commission_percent: number; commission_paise: number; currency: string; status: string; payment_record_id: number; created_at: Date | string }>>(
+      `SELECT ac.id, au.email AS affiliate_email, au.display_name AS affiliate_name, ru.email AS referred_email,
+        ac.amount_paise, ac.commission_percent, ac.commission_paise, p.currency, ac.status, ac.payment_record_id, ac.created_at
+       FROM affiliate_commissions ac JOIN payments p ON p.id = ac.payment_record_id JOIN users au ON au.id = ac.affiliate_user_id JOIN users ru ON ru.id = ac.referred_user_id
+       ORDER BY ac.created_at DESC LIMIT 500`,
+    );
+    const [applications] = await pool.query<Array<RowDataPacket & { id: number; user_id: string; email: string; display_name: string | null; website_url: string; status: string; review_note: string | null; created_at: Date | string }>>(
+      `SELECT aa.id, aa.user_id, u.email, u.display_name, aa.website_url, aa.status, aa.review_note, aa.created_at
+       FROM affiliate_applications aa JOIN users u ON u.id = aa.user_id
+       WHERE aa.status = 'pending' AND u.account_role = 'user' AND u.status = 'active'
+       ORDER BY aa.created_at ASC LIMIT 200`,
+    );
+    const origin = appOrigin();
+    return NextResponse.json({
+      affiliates: rows.map((row) => ({ userId: row.user_id, email: row.email, displayName: row.display_name || '', referralCode: row.referral_code,
+        affiliateType: row.affiliate_type || 'admin_created', websiteUrl: row.website_url || '', commissionPercent: Number(row.commission_percent), status: row.affiliate_status, createdAt: row.created_at,
+        referralCount: Number(row.referral_count || 0), convertedCount: Number(row.converted_count || 0), commissionByCurrency: totalsMap.get(row.user_id) || [],
+        referralUrl: `${origin}/login?ref=${encodeURIComponent(row.referral_code)}` })),
+      commissionLedger: ledgerRows.map((row) => ({ id: Number(row.id), affiliateEmail: row.affiliate_email, affiliateName: row.affiliate_name || '', referredEmail: row.referred_email,
+        amount: Number(row.amount_paise || 0) / 100, currency: row.currency || 'INR', commissionPercent: Number(row.commission_percent || 0), commission: Number(row.commission_paise || 0) / 100,
+        status: row.status, paymentRecordId: Number(row.payment_record_id), createdAt: row.created_at })),
+      applications: applications.map((row) => ({ id: Number(row.id), userId: row.user_id, email: row.email, displayName: row.display_name || '', websiteUrl: row.website_url, status: row.status, reviewNote: row.review_note, createdAt: row.created_at })),
+      scope: 'all-affiliates',
+    }, { headers: { 'Cache-Control': 'no-store' } });
+  } catch (error) {
+    console.error('Affiliates API failed:', error);
+    return NextResponse.json({ error: 'Unable to load affiliate information. Run the external affiliate migration if needed.' }, { status: 500 });
+  }
+}
+
+export async function PATCH(request: NextRequest) {
+  let connection: Awaited<ReturnType<ReturnType<typeof getPool>['getConnection']>> | null = null;
+  try {
+    const actor = await getAdminPrincipal();
+    if (!actor || actor.isAffiliate || (!actor.isSuperAdmin && !hasPermission(actor, 'affiliates.manage'))) return NextResponse.json({ error: 'Affiliate management access required.' }, { status: 403 });
+    const body = await request.json();
+
+    if (body.applicationId !== undefined) {
+      const applicationId = Number(body.applicationId);
+      const applicationAction = String(body.applicationAction || '');
+      if (!Number.isSafeInteger(applicationId) || applicationId < 1 || !['approve', 'reject'].includes(applicationAction)) return NextResponse.json({ error: 'Choose a valid affiliate application action.' }, { status: 400 });
+      const commissionPercent = body.commissionPercent === undefined ? 10 : Number(body.commissionPercent);
+      if (applicationAction === 'approve' && (!Number.isFinite(commissionPercent) || commissionPercent < 0 || commissionPercent > 100)) return NextResponse.json({ error: 'Commission must be between 0 and 100 percent.' }, { status: 400 });
+      connection = await getPool().getConnection();
+      await connection.beginTransaction();
+      const [appRows] = await connection.execute<Array<RowDataPacket & { id: number; user_id: string; email: string; website_url: string; status: string; account_role: string; user_status: string }>>(
+        `SELECT aa.id, aa.user_id, u.email, aa.website_url, aa.status, u.account_role, u.status AS user_status
+         FROM affiliate_applications aa JOIN users u ON u.id = aa.user_id WHERE aa.id = ? LIMIT 1 FOR UPDATE`, [applicationId],
+      );
+      const app = appRows[0];
+      if (!app) { await connection.rollback(); return NextResponse.json({ error: 'Affiliate application not found.' }, { status: 404 }); }
+      if (app.status !== 'pending') { await connection.rollback(); return NextResponse.json({ error: 'This application has already been reviewed.' }, { status: 409 }); }
+      if (applicationAction === 'reject') {
+        const reviewNote = String(body.reviewNote || '').trim().slice(0, 512) || null;
+        await connection.execute("UPDATE affiliate_applications SET status = 'rejected', review_note = ?, reviewed_by_admin_id = ?, reviewed_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = ?", [reviewNote, actor.id, applicationId]);
+        await connection.commit();
+        await logAdminAction(actor.id, 'affiliate.application_rejected', 'affiliate_application', applicationId, { userId: app.user_id, websiteUrl: app.website_url, reviewNote }, request);
+        return NextResponse.json({ success: true, message: 'Affiliate application rejected.' });
+      }
+      if (app.user_status !== 'active' || app.account_role !== 'user') { await connection.rollback(); return NextResponse.json({ error: 'Only an active regular-user account can be approved.' }, { status: 409 }); }
+      const code = await uniqueReferralCode(connection);
+      await connection.execute("UPDATE users SET account_role = 'affiliate', is_admin = 1, updated_at = UTC_TIMESTAMP() WHERE id = ?", [app.user_id]);
+      await connection.execute('DELETE FROM admin_user_permissions WHERE user_id = ?', [app.user_id]);
+      await connection.execute(
+        `INSERT INTO affiliate_profiles (user_id, referral_code, commission_percent, payout_email, status, affiliate_type, website_url)
+         VALUES (?, ?, ?, ?, 'active', 'external_website', ?)`, [app.user_id, code, commissionPercent, app.email, app.website_url],
+      );
+      await connection.execute("UPDATE affiliate_applications SET status = 'approved', review_note = NULL, reviewed_by_admin_id = ?, reviewed_at = UTC_TIMESTAMP(), updated_at = UTC_TIMESTAMP() WHERE id = ?", [actor.id, applicationId]);
+      await connection.commit();
+      await logAdminAction(actor.id, 'affiliate.application_approved', 'affiliate_application', applicationId, { userId: app.user_id, websiteUrl: app.website_url, commissionPercent, referralCode: code }, request);
+      return NextResponse.json({ success: true, message: 'Affiliate approved. Their unique referral link is now available in their affiliate dashboard.' });
+    }
+
+    if (body.userId) {
+      const userId = String(body.userId);
+      if (!userId || userId.length > 36) return NextResponse.json({ error: 'Select a valid affiliate.' }, { status: 400 });
+      const [profiles] = await getPool().execute<Array<RowDataPacket & { commission_percent: number; status: string; affiliate_type: string; website_url: string | null }>>(
+        "SELECT ap.commission_percent, ap.status, ap.affiliate_type, ap.website_url FROM affiliate_profiles ap JOIN users u ON u.id = ap.user_id WHERE ap.user_id = ? AND u.account_role = 'affiliate' LIMIT 1", [userId],
+      );
+      if (!profiles.length) return NextResponse.json({ error: 'Affiliate profile not found.' }, { status: 404 });
+      const updates: string[] = [];
+      const values: Array<string | number | null> = [];
+      const details: Record<string, unknown> = {};
+      if (body.commissionPercent !== undefined) {
+        const rate = Number(body.commissionPercent);
+        if (!Number.isFinite(rate) || rate < 0 || rate > 100) return NextResponse.json({ error: 'Commission must be between 0 and 100 percent.' }, { status: 400 });
+        updates.push('commission_percent = ?'); values.push(rate); details.commissionPercent = rate;
+      }
+      if (body.affiliateStatus !== undefined) {
+        if (!['active','paused'].includes(String(body.affiliateStatus))) return NextResponse.json({ error: 'Affiliate status must be active or paused.' }, { status: 400 });
+        updates.push('status = ?'); values.push(body.affiliateStatus); details.status = body.affiliateStatus;
+      }
+      if (body.affiliateType !== undefined) {
+        if (!['admin_created','external_website'].includes(String(body.affiliateType))) return NextResponse.json({ error: 'Invalid affiliate type.' }, { status: 400 });
+        updates.push('affiliate_type = ?'); values.push(body.affiliateType); details.affiliateType = body.affiliateType;
+      }
+      if (body.websiteUrl !== undefined) {
+        const websiteUrl = String(body.websiteUrl || '').trim();
+        if (websiteUrl && !/^https?:\/\//i.test(websiteUrl)) return NextResponse.json({ error: 'Website URL must start with http:// or https://.' }, { status: 400 });
+        if (websiteUrl.length > 512) return NextResponse.json({ error: 'Website URL is too long.' }, { status: 400 });
+        updates.push('website_url = ?'); values.push(websiteUrl || null); details.websiteUrl = websiteUrl || null;
+      }
+      const nextType = String(body.affiliateType ?? profiles[0].affiliate_type ?? 'admin_created');
+      const rawNextUrl = body.websiteUrl === undefined ? String(profiles[0].website_url || '') : String(body.websiteUrl || '').trim();
+      let nextWebsite: string | null = null;
+      if (rawNextUrl) { try { const parsed = new URL(rawNextUrl); if (!['http:','https:'].includes(parsed.protocol) || parsed.username || parsed.password || !parsed.hostname.includes('.') || ['localhost','127.0.0.1'].includes(parsed.hostname.toLowerCase())) throw new Error('invalid'); nextWebsite = parsed.toString().replace(/\/$/, ''); } catch { return NextResponse.json({ error: 'Enter a valid public website URL starting with https:// or http://.' }, { status: 400 }); } }
+      if (!['admin_created','external_website'].includes(nextType)) return NextResponse.json({ error: 'Invalid affiliate type.' }, { status: 400 });
+      if (rawNextUrl.length > 512) return NextResponse.json({ error: 'Website URL is too long.' }, { status: 400 });
+      if (nextType === 'external_website' && !nextWebsite) return NextResponse.json({ error: 'External website affiliates must have a valid website URL.' }, { status: 400 });
+      if (!updates.length) return NextResponse.json({ error: 'No affiliate changes supplied.' }, { status: 400 });
+      values.push(userId);
+      await getPool().execute(`UPDATE affiliate_profiles SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?`, values);
+      await logAdminAction(actor.id, 'affiliate.profile_updated', 'affiliate_profile', userId, details, request);
+      return NextResponse.json({ success: true, message: 'Affiliate profile updated.' });
+    }
+
+    const commissionId = Number(body.commissionId);
+    const status = String(body.status || '');
+    if (!Number.isSafeInteger(commissionId) || commissionId < 1 || !['approved', 'paid', 'reversed'].includes(status)) return NextResponse.json({ error: 'Choose a valid commission and status.' }, { status: 400 });
+    const [rows] = await getPool().execute<Array<RowDataPacket & { status: string; affiliate_user_id: string; commission_paise: number }>>(
+      'SELECT status, affiliate_user_id, commission_paise FROM affiliate_commissions WHERE id = ? LIMIT 1', [commissionId],
+    );
+    if (!rows.length) return NextResponse.json({ error: 'Commission record not found.' }, { status: 404 });
+    if (rows[0].status === 'paid' && status !== 'paid') return NextResponse.json({ error: 'A paid commission cannot be changed here.' }, { status: 409 });
+    if (status === 'paid' && rows[0].status !== 'approved') return NextResponse.json({ error: 'Approve a commission before marking it paid.' }, { status: 409 });
+    if (rows[0].status === 'reversed') return NextResponse.json({ error: 'A reversed commission cannot be changed.' }, { status: 409 });
+    await getPool().execute('UPDATE affiliate_commissions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [status, commissionId]);
+    await logAdminAction(actor.id, 'affiliate.commission_status_updated', 'affiliate_commission', commissionId, { status, affiliateUserId: rows[0].affiliate_user_id, commissionPaise: Number(rows[0].commission_paise || 0) }, request);
+    return NextResponse.json({ success: true, message: `Commission marked ${status}.` });
+  } catch (error) {
+    if (connection) { try { await connection.rollback(); } catch { /* ignore rollback failures */ } }
+    console.error('Affiliate administration update failed:', error);
+    return NextResponse.json({ error: 'Unable to update affiliate data.' }, { status: 500 });
+  } finally { connection?.release(); }
+}
+
+
+========================================
+FILE: D:\next.js\sportrz\src\app\api\affiliate\apply\route.ts
+========================================
+import { NextRequest, NextResponse } from 'next/server';
+import type { RowDataPacket } from 'mysql2/promise';
+import { getCurrentUser } from '@/lib/session';
+import { getPool } from '@/lib/mysql';
+
+export const runtime = 'nodejs';
+
+function normalizeWebsiteUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || value.trim().length > 512) return null;
+  try {
+    const parsed = new URL(value.trim());
+    if (!['http:', 'https:'].includes(parsed.protocol)) return null;
+    if (parsed.username || parsed.password) return null;
+    if (!parsed.hostname.includes('.') || ['localhost', '127.0.0.1'].includes(parsed.hostname.toLowerCase())) return null;
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    return null;
+  }
+}
+
+export async function GET() {
+  try {
+    const user = await getCurrentUser();
+    if (!user) return NextResponse.json({ error: 'Sign in with email OTP to continue.' }, { status: 401 });
+    const pool = getPool();
+    const [users] = await pool.execute<Array<RowDataPacket & { account_role: string }>>('SELECT account_role FROM users WHERE id = ? LIMIT 1', [user.uid]);
+    const role = users[0]?.account_role;
+    if (!role) return NextResponse.json({ error: 'Account not found.' }, { status: 404 });
+    const [profiles] = await pool.execute<Array<RowDataPacket & { referral_code: string; commission_percent: number; status: string; affiliate_type: string; website_url: string | null }>>(
+      'SELECT referral_code, commission_percent, status, affiliate_type, website_url FROM affiliate_profiles WHERE user_id = ? LIMIT 1', [user.uid],
+    );
+    if (profiles[0]) {
+      const publicOrigin = process.env.NEXT_PUBLIC_APP_URL;
+      const fallbackOrigin = process.env.NODE_ENV === 'production' ? 'https://sportrz.com' : 'http://localhost:3000';
+      const origin = (publicOrigin && !/^https?:\/\/localhost(?::\d+)?$/i.test(publicOrigin) ? publicOrigin : fallbackOrigin).replace(/\/$/, '');
+      return NextResponse.json({ state: 'affiliate', profile: { ...profiles[0], referralUrl: `${origin}/login?ref=${encodeURIComponent(profiles[0].referral_code)}` } });
+    }
+    const [applications] = await pool.execute<Array<RowDataPacket & { id: number; website_url: string; status: string; review_note: string | null; created_at: Date | string; updated_at: Date | string }>>(
+      'SELECT id, website_url, status, review_note, created_at, updated_at FROM affiliate_applications WHERE user_id = ? LIMIT 1', [user.uid],
+    );
+    return NextResponse.json({ state: role === 'user' ? (applications[0]?.status || 'not_applied') : 'not_eligible', application: applications[0] || null });
+  } catch (error) {
+    console.error('Affiliate application read failed:', error);
+    return NextResponse.json({ error: 'Unable to load your affiliate application.' }, { status: 500 });
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const user = await getCurrentUser();
+    if (!user) return NextResponse.json({ error: 'Sign in with email OTP before applying.' }, { status: 401 });
+    const body = await request.json();
+    const websiteUrl = normalizeWebsiteUrl(body.websiteUrl);
+    if (!websiteUrl) return NextResponse.json({ error: 'Enter a valid public website URL starting with https:// or http://.' }, { status: 400 });
+
+    const pool = getPool();
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [users] = await connection.execute<Array<RowDataPacket & { account_role: string; status: string }>>(
+        'SELECT account_role, status FROM users WHERE id = ? FOR UPDATE', [user.uid],
+      );
+      const account = users[0];
+      if (!account || account.status !== 'active') {
+        await connection.rollback();
+        return NextResponse.json({ error: 'Your account is not active.' }, { status: 403 });
+      }
+      if (account.account_role !== 'user') {
+        await connection.rollback();
+        return NextResponse.json({ error: account.account_role === 'affiliate' ? 'This account already has affiliate access.' : 'Only a regular user account can apply for affiliate access.' }, { status: 409 });
+      }
+      const [existingProfile] = await connection.execute<RowDataPacket[]>('SELECT user_id FROM affiliate_profiles WHERE user_id = ? LIMIT 1', [user.uid]);
+      if (existingProfile.length) {
+        await connection.rollback();
+        return NextResponse.json({ error: 'An affiliate profile already exists for this account.' }, { status: 409 });
+      }
+      const [existing] = await connection.execute<Array<RowDataPacket & { id: number; status: string }>>(
+        'SELECT id, status FROM affiliate_applications WHERE user_id = ? LIMIT 1 FOR UPDATE', [user.uid],
+      );
+      if (existing[0]?.status === 'approved') {
+        await connection.rollback();
+        return NextResponse.json({ error: 'This application has already been approved.' }, { status: 409 });
+      }
+      if (existing[0]) {
+        await connection.execute(
+          `UPDATE affiliate_applications SET website_url = ?, status = 'pending', review_note = NULL, reviewed_by_admin_id = NULL, reviewed_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+          [websiteUrl, existing[0].id],
+        );
+      } else {
+        await connection.execute('INSERT INTO affiliate_applications (user_id, website_url, status) VALUES (?, ?, \'pending\')', [user.uid, websiteUrl]);
+      }
+      await connection.commit();
+      return NextResponse.json({ success: true, state: 'pending', message: 'Application submitted. An admin will review your website before activating your referral profile.' }, { status: 201 });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    console.error('Affiliate application submit failed:', error);
+    return NextResponse.json({ error: 'Unable to submit your application. Please try again.' }, { status: 500 });
+  }
+}
+
+
+========================================
+FILE: D:\next.js\sportrz\src\lib\affiliate-commission.ts
+========================================
+import type { PoolConnection, ResultSetHeader } from 'mysql2/promise';
+
+/**
+ * Idempotently create the commission for a captured Razorpay payment.
+ *
+ * New referral records explicitly store UTC timestamps in verify-otp/route.ts.
+ * Commission eligibility is based on the immutable referral association plus a
+ * captured payment, not by comparing legacy DATETIME values: older records may
+ * have been written with the database server's local timezone. The unique key
+ * on payment_record_id plus INSERT IGNORE protects retries and concurrent calls.
+ */
+export async function ensureAffiliateCommissionForPayment(
+  connection: PoolConnection,
+  paymentRecordId: number,
+): Promise<number> {
+  const [result] = await connection.execute<ResultSetHeader>(
+    `INSERT IGNORE INTO affiliate_commissions
+       (affiliate_user_id, referred_user_id, payment_record_id,
+        amount_paise, commission_percent, commission_paise, status)
+     SELECT
+        ar.affiliate_user_id,
+        ar.referred_user_id,
+        p.id,
+        p.amount_paise,
+        ap.commission_percent,
+        FLOOR(p.amount_paise * ap.commission_percent / 100),
+        'pending'
+     FROM payments p
+     JOIN affiliate_referrals ar
+       ON ar.referred_user_id = p.user_id
+      AND ar.status = 'qualified'
+     JOIN affiliate_profiles ap
+       ON ap.user_id = ar.affiliate_user_id
+      AND ap.status = 'active'
+     JOIN users au
+       ON au.id = ap.user_id
+      AND au.account_role = 'affiliate'
+      AND au.status = 'active'
+     WHERE p.id = ?
+       AND p.provider = 'razorpay'
+       AND p.status = 'captured'
+       AND p.paid_at IS NOT NULL
+     LIMIT 1`,
+    [paymentRecordId],
+  );
+
+  return result.affectedRows;
+}

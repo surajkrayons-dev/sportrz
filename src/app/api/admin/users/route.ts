@@ -41,7 +41,7 @@ export async function GET(request: NextRequest) {
         af.referral_code,
         (SELECT pl.code FROM subscriptions s INNER JOIN plans pl ON pl.id = s.plan_id WHERE s.user_id = u.id AND s.status = 'active' AND (s.end_at IS NULL OR s.end_at > UTC_TIMESTAMP()) ORDER BY s.end_at DESC LIMIT 1) AS active_subscription
        FROM users u ${join}
-       LEFT JOIN affiliate_referrals ar2 ON ar2.referred_user_id = u.id
+       LEFT JOIN affiliate_referrals ar2 ON ar2.referred_user_id = u.id AND ar2.affiliate_user_id = ar.affiliate_user_id
        LEFT JOIN affiliate_profiles af ON af.user_id = ar2.affiliate_user_id
        WHERE ${where}
        GROUP BY u.id, u.email, u.display_name, u.account_role, u.status, u.created_at, u.last_login_at, u.email_verified_at, af.referral_code

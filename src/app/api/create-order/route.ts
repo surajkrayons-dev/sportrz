@@ -48,8 +48,9 @@ export async function POST(request: NextRequest) {
       referral_code: string;
       affiliate_email: string;
       affiliate_name: string | null;
+      click_id: string | null;
     }>>(
-      `SELECT ar.affiliate_user_id, ar.referral_code,
+      `SELECT ar.affiliate_user_id, ar.referral_code, ar.click_id,
               au.email AS affiliate_email, au.display_name AS affiliate_name
          FROM affiliate_referrals ar
          JOIN affiliate_profiles ap ON ap.user_id = ar.affiliate_user_id
@@ -70,6 +71,7 @@ export async function POST(request: NextRequest) {
       affiliate_code: String(affiliate?.referral_code || 'none').slice(0, 256),
       affiliate_email: String(affiliate?.affiliate_email || 'none').slice(0, 256),
       affiliate_name: String(affiliate?.affiliate_name || 'none').slice(0, 256),
+      affiliate_click_id: String(affiliate?.click_id || 'none').slice(0, 256),
     };
 
     // Razorpay supports up to 15 note key/value pairs. Keep the full attribution

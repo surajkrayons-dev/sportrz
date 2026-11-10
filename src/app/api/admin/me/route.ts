@@ -17,7 +17,7 @@ export async function GET() {
          WHERE ap.user_id = ? AND u.account_role = 'affiliate' LIMIT 1`, [actor.id],
       );
       const row = rows[0];
-      if (row) { const configuredOrigin = process.env.NEXT_PUBLIC_APP_URL; const fallbackOrigin = process.env.NODE_ENV === 'production' ? 'https://sportrz.com' : 'http://localhost:3000'; const origin = (configuredOrigin && !/^https?:\/\/localhost(?::\d+)?$/i.test(configuredOrigin) ? configuredOrigin : fallbackOrigin).replace(/\/$/, ''); affiliate = { ...row, commission_percent: Number(row.commission_percent), referralUrl: `${origin}/login?ref=${encodeURIComponent(row.referral_code)}` }; }
+      if (row) { const configuredOrigin = process.env.NEXT_PUBLIC_APP_URL; const fallbackOrigin = process.env.NODE_ENV === 'production' ? 'https://sportrz.com' : 'http://localhost:3000'; const origin = (configuredOrigin && !/^https?:\/\/localhost(?::\d+)?$/i.test(configuredOrigin) ? configuredOrigin : fallbackOrigin).replace(/\/$/, ''); affiliate = { ...row, commission_percent: Number(row.commission_percent), referralUrl: `${origin}/login?ref=${encodeURIComponent(row.referral_code)}${row.affiliate_type === 'external_website' ? '&click_id={click_id}' : ''}` }; }
     }
     const [identityRows] = await getPool().execute<Array<RowDataPacket & { display_name: string | null }>>(
       'SELECT display_name FROM users WHERE id = ? LIMIT 1', [actor.id],

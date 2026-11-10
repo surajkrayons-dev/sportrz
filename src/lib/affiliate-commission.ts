@@ -1,13 +1,12 @@
 import type { PoolConnection, ResultSetHeader } from 'mysql2/promise';
 
 /**
- * Idempotently create the commission for a captured Razorpay payment.
+ * Creates an affiliate commission and its optional external postback outbox row.
  *
- * New referral records explicitly store UTC timestamps in verify-otp/route.ts.
- * Commission eligibility is based on the immutable referral association plus a
- * captured payment, not by comparing legacy DATETIME values: older records may
- * have been written with the database server's local timezone. The unique key
- * on payment_record_id plus INSERT IGNORE protects retries and concurrent calls.
+ * Attribution is based on the immutable referral association and a captured
+ * payment that happened after the referral was created. Unique keys make both
+ * inserts safe to execute repeatedly from browser verification and Razorpay
+ * webhook retries.
  */
 export async function ensureAffiliateCommissionForPayment(
   connection: PoolConnection,
@@ -29,6 +28,7 @@ export async function ensureAffiliateCommissionForPayment(
      JOIN affiliate_referrals ar
        ON ar.referred_user_id = p.user_id
       AND ar.status = 'qualified'
+      AND COALESCE(p.paid_at, p.created_at) >= ar.created_at
      JOIN affiliate_profiles ap
        ON ap.user_id = ar.affiliate_user_id
       AND ap.status = 'active'
@@ -39,8 +39,26 @@ export async function ensureAffiliateCommissionForPayment(
      WHERE p.id = ?
        AND p.provider = 'razorpay'
        AND p.status = 'captured'
-       AND p.paid_at IS NOT NULL
      LIMIT 1`,
+    [paymentRecordId],
+  );
+
+  // Queue a postback only for external partners with a configured destination.
+  // The destination is snapshotted so later profile edits do not rewrite history.
+  await connection.execute(
+    `INSERT IGNORE INTO affiliate_postback_deliveries
+       (affiliate_user_id, commission_id, destination_url, status)
+     SELECT ac.affiliate_user_id, ac.id, ap.postback_url, 'pending'
+       FROM affiliate_commissions ac
+       JOIN affiliate_profiles ap ON ap.user_id = ac.affiliate_user_id
+       JOIN users au ON au.id = ap.user_id
+      WHERE ac.payment_record_id = ?
+        AND ap.affiliate_type = 'external_website'
+        AND ap.postback_url IS NOT NULL
+        AND ap.postback_url <> ''
+        AND ap.status = 'active'
+        AND au.account_role = 'affiliate'
+        AND au.status = 'active'`,
     [paymentRecordId],
   );
 

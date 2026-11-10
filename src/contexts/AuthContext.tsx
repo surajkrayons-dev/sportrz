@@ -9,7 +9,7 @@ interface AuthContextType {
   currentUser: User | null;
   loading: boolean;
   requestLoginOtp: (email: string) => Promise<{ message: string; retryAfterSeconds: number }>;
-  verifyLoginOtp: (email: string, otp: string, referralCode?: string) => Promise<{ isNewUser: boolean }>;
+  verifyLoginOtp: (email: string, otp: string, referralCode?: string, clickId?: string) => Promise<{ isNewUser: boolean }>;
   logout: () => Promise<void>;
   resendVerificationEmail: (email?: string) => Promise<string | null>;
   resetPassword: (email: string) => Promise<string | null>;
@@ -76,11 +76,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   };
 
-  const verifyLoginOtp = async (email: string, otp: string, referralCode?: string) => {
+  const verifyLoginOtp = async (email: string, otp: string, referralCode?: string, clickId?: string) => {
     const response = await fetch('/api/auth/verify-otp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, otp, referralCode }),
+      body: JSON.stringify({ email, otp, referralCode, clickId }),
     });
     const data = await readApiResponse(response);
     await refreshUser();

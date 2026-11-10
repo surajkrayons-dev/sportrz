@@ -24,12 +24,15 @@ export default function EmailOtpAuth() {
   const [notice, setNotice] = useState('');
   const [resendSeconds, setResendSeconds] = useState(0);
   const [referralCode, setReferralCode] = useState('');
+  const [referralClickId, setReferralClickId] = useState('');
   const { requestLoginOtp, verifyLoginOtp, currentUser, loading: authLoading } = useAuth();
   const router = useRouter();
 
   useEffect(() => {
     const value = new URLSearchParams(window.location.search).get('ref') || '';
     if (/^[A-Z0-9-]{3,32}$/i.test(value)) setReferralCode(value.toUpperCase());
+    const clickId = new URLSearchParams(window.location.search).get('click_id') || '';
+    if (/^[A-Za-z0-9._~-]{1,191}$/.test(clickId)) setReferralClickId(clickId);
   }, []);
 
   useEffect(() => {
@@ -90,7 +93,7 @@ export default function EmailOtpAuth() {
     setError('');
     setNotice('');
     try {
-      await verifyLoginOtp(email, otp, referralCode || undefined);
+      await verifyLoginOtp(email, otp, referralCode || undefined, referralClickId || undefined);
       const requested = new URLSearchParams(window.location.search).get('next') || '/';
       const safeNext = requested.startsWith('/') && !requested.startsWith('//') ? requested : '/';
       router.replace(safeNext);

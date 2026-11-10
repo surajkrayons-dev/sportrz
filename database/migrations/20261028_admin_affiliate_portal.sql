@@ -8,6 +8,12 @@ UPDATE users
    SET account_role = 'super_admin'
  WHERE is_admin = 1 AND account_role = 'user';
 
+-- Ensure all privileged account roles (including affiliate marketers) can enter
+-- the role-restricted portal through the existing is_admin session flag.
+UPDATE users
+   SET is_admin = 1
+ WHERE account_role IN ('super_admin','subadmin','affiliate') AND is_admin = 0;
+
 ALTER TABLE subscriptions
   ADD COLUMN IF NOT EXISTS assigned_by_admin_id CHAR(36) DEFAULT NULL;
 

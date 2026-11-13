@@ -1,36 +1,37 @@
 import { createHmac } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import https from 'node:https';
+import { checkServerIdentity as tlsCheckServerIdentity } from 'node:tls';
 import { isIP } from 'node:net';
 import type { ResultSetHeader, RowDataPacket } from 'mysql2/promise';
 import { getPool } from '@/lib/mysql';
 
+export type AffiliatePostbackMethod = 'POST' | 'GET';
+export type AffiliatePostbackPayload = Record<string, string | number>;
+
 const ALLOWED_MACROS = new Set([
-  'affiliate_code',
-  'click_id',
-  'order_id',
-  'payment_id',
-  'amount',
-  'currency',
-  'commission',
-  'commission_percent',
-  'commission_id',
-  'status',
+  'affiliate_code', 'click_id', 'order_id', 'payment_id', 'amount', 'currency',
+  'commission', 'commission_percent', 'commission_id', 'status',
 ]);
+const REQUEST_TIMEOUT_MS = 10_000;
+const MAX_RESPONSE_BYTES = 4_000;
 
 function isPublicIpv4(address: string): boolean {
   const parts = address.split('.').map(Number);
   if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
-  const [a, b] = parts;
+  const [a, b, c] = parts;
+  // Reject unspecified, private, loopback, link-local, carrier-grade NAT,
+  // documentation, benchmarking, multicast and reserved IPv4 ranges.
   return !(
-    a === 0 || a === 10 || a === 127 ||
+    a === 0 || a === 10 || a === 127 || a >= 224 ||
     (a === 100 && b >= 64 && b <= 127) ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 0) ||
+    (a === 192 && b === 0 && (c === 0 || c === 2)) ||
+    (a === 192 && b === 88 && c === 99) ||
     (a === 192 && b === 168) ||
-    (a === 198 && (b === 18 || b === 19)) ||
-    a >= 224
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+    (a === 203 && b === 0 && c === 113)
   );
 }
 
@@ -38,20 +39,24 @@ function isPublicIpv6(address: string): boolean {
   const normalized = address.toLowerCase();
   if (normalized.startsWith('::ffff:')) {
     const mapped = normalized.slice('::ffff:'.length);
-    if (isIP(mapped) === 4) return isPublicIpv4(mapped);
-    return false;
+    return isIP(mapped) === 4 && isPublicIpv4(mapped);
   }
-  if (normalized === '::' || normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe8') || normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb') || normalized.startsWith('ff') || normalized.startsWith('2001:db8:')) return false;
-  // Public IPv6 unicast addresses are in 2000::/3.
+  if (normalized === '::' || normalized === '::1' || normalized.startsWith('fc') ||
+      normalized.startsWith('fd') || normalized.startsWith('fe8') || normalized.startsWith('fe9') ||
+      normalized.startsWith('fea') || normalized.startsWith('feb') || normalized.startsWith('ff') ||
+      normalized.startsWith('2001:db8:')) return false;
+  // Global unicast IPv6 currently resides in 2000::/3.
   const firstSegment = Number.parseInt(normalized.split(':')[0] || '0', 16);
   return Number.isFinite(firstSegment) && (firstSegment & 0xe000) === 0x2000;
 }
 
 function isPublicAddress(address: string): boolean {
   const version = isIP(address);
-  if (version === 4) return isPublicIpv4(address);
-  if (version === 6) return isPublicIpv6(address);
-  return false;
+  return version === 4 ? isPublicIpv4(address) : version === 6 ? isPublicIpv6(address) : false;
+}
+
+function toStringValues(payload: AffiliatePostbackPayload): Record<string, string> {
+  return Object.fromEntries(Object.entries(payload).map(([key, value]) => [key, String(value ?? '')]));
 }
 
 function replaceMacros(template: string, values: Record<string, string>): string {
@@ -74,10 +79,11 @@ export function normalizePostbackTemplate(value: unknown): string | null {
   try {
     const sampleValues = Object.fromEntries([...ALLOWED_MACROS].map((macro) => [macro, 'sample-value'])) as Record<string, string>;
     const parsed = new URL(replaceMacros(template, sampleValues));
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
     if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.hash) return null;
     if (parsed.port && parsed.port !== '443') return null;
-    const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
     if (!hostname || hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') || hostname.endsWith('.internal')) return null;
+    if (parsed.toString().length > 2048) return null;
     return template;
   } catch {
     return null;
@@ -87,11 +93,14 @@ export function normalizePostbackTemplate(value: unknown): string | null {
 async function resolvePublicPostbackAddress(value: string): Promise<{ address: string; family: 4 | 6 }> {
   const parsed = new URL(value);
   const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (parsed.protocol !== 'https:' || (parsed.port && parsed.port !== '443')) {
+    throw new Error('The postback endpoint must use HTTPS on the standard port.');
+  }
 
-  if (isIP(hostname)) {
-    const family = isIP(hostname);
+  const ipVersion = isIP(hostname);
+  if (ipVersion) {
     if (!isPublicAddress(hostname)) throw new Error('The postback host must be a public internet address.');
-    return { address: hostname, family: family as 4 | 6 };
+    return { address: hostname, family: ipVersion as 4 | 6 };
   }
 
   let addresses: Array<{ address: string; family: number }>;
@@ -103,13 +112,15 @@ async function resolvePublicPostbackAddress(value: string): Promise<{ address: s
   if (!addresses.length || addresses.some((item) => !isPublicAddress(item.address))) {
     throw new Error('The postback host must resolve only to public internet addresses.');
   }
-  const selected = addresses[0];
+  // Prefer IPv4 where available; it is more consistently routable on shared
+  // hosting and local developer networks. IPv6 remains a valid fallback.
+  const selected = addresses.find((item) => item.family === 4) || addresses[0];
   return { address: selected.address, family: selected.family as 4 | 6 };
 }
 
 export async function assertPublicPostbackUrl(value: string): Promise<void> {
   const normalized = normalizePostbackTemplate(value);
-  if (!normalized) throw new Error('Use a valid public HTTPS postback URL. Only supported macros are allowed.');
+  if (!normalized) throw new Error('Enter a valid public HTTPS postback URL. Only supported macros are allowed.');
   const sampleValues = Object.fromEntries([...ALLOWED_MACROS].map((macro) => [macro, 'sample-value'])) as Record<string, string>;
   await resolvePublicPostbackAddress(replaceMacros(normalized, sampleValues));
 }
@@ -117,32 +128,63 @@ export async function assertPublicPostbackUrl(value: string): Promise<void> {
 function sendPinnedPostback(
   target: URL,
   pinnedAddress: { address: string; family: 4 | 6 },
+  method: AffiliatePostbackMethod,
+  payload: AffiliatePostbackPayload,
   headers: Record<string, string>,
 ): Promise<{ status: number; responseExcerpt: string }> {
   return new Promise((resolve, reject) => {
-    const request = https.request(target, {
-      method: 'GET',
-      headers,
-      timeout: 8000,
+    const body = method === 'POST' ? Buffer.from(JSON.stringify(payload), 'utf8') : null;
+    const requestHeaders: Record<string, string> = {
+      Accept: 'application/json, text/plain, */*',
+      Host: target.host,
+      'User-Agent': 'Sportrz-Affiliate-Postback/1.0',
+      ...headers,
+    };
+    if (body) {
+      requestHeaders['Content-Type'] = 'application/json; charset=utf-8';
+      requestHeaders['Content-Length'] = String(body.byteLength);
+    }
+
+    // Connect to the exact public IP that was checked during DNS validation.
+    // Keep the original host for TLS SNI/certificate verification and the Host header.
+    // This avoids a second DNS lookup and prevents DNS-rebinding SSRF attacks.
+    const hostnameIsIp = isIP(target.hostname) !== 0;
+    const request = https.request({
+      protocol: 'https:',
+      hostname: pinnedAddress.address,
+      family: pinnedAddress.family,
+      port: Number(target.port || 443),
+      path: `${target.pathname}${target.search}`,
+      method,
+      headers: requestHeaders,
+      servername: hostnameIsIp ? undefined : target.hostname,
+      // Always validate the certificate against the configured host name, not
+      // the pinned IP used for the TCP connection.
+      checkServerIdentity: (_hostname, certificate) => tlsCheckServerIdentity(target.hostname.replace(/^\[|\]$/g, ''), certificate),
+      rejectUnauthorized: true,
+      timeout: REQUEST_TIMEOUT_MS,
       maxHeaderSize: 16 * 1024,
-      // Pin the DNS result we just validated to prevent DNS-rebinding SSRF.
-      lookup: (_hostname, _options, callback) => {
-        callback(null, pinnedAddress.address, pinnedAddress.family);
-      },
+      agent: false,
     }, (response) => {
       let responseExcerpt = '';
+      let retainedBytes = 0;
       response.setEncoding('utf8');
       response.on('data', (chunk: string) => {
-        if (responseExcerpt.length < 500) responseExcerpt += chunk.slice(0, 500 - responseExcerpt.length);
+        if (retainedBytes >= MAX_RESPONSE_BYTES) return;
+        const remaining = MAX_RESPONSE_BYTES - retainedBytes;
+        const chunkBuffer = Buffer.from(chunk, 'utf8');
+        const retained = chunkBuffer.subarray(0, remaining);
+        responseExcerpt += retained.toString('utf8');
+        retainedBytes += retained.byteLength;
       });
-      response.on('end', () => {
-        resolve({ status: Number(response.statusCode || 0), responseExcerpt });
-      });
+      response.on('end', () => resolve({ status: Number(response.statusCode || 0), responseExcerpt }));
       response.on('error', reject);
+      response.on('aborted', () => reject(new Error('The partner server closed the response before it completed.')));
     });
 
-    request.on('timeout', () => request.destroy(new Error('Partner postback timed out after 8 seconds.')));
+    request.on('timeout', () => request.destroy(new Error(`Partner postback timed out after ${REQUEST_TIMEOUT_MS / 1000} seconds.`)));
     request.on('error', reject);
+    if (body) request.write(body);
     request.end();
   });
 }
@@ -153,12 +195,51 @@ export function getAffiliatePostbackSecret(affiliateUserId: string): string {
   return createHmac('sha256', masterSecret).update(`sportrz-affiliate-postback-v1:${affiliateUserId}`).digest('hex');
 }
 
+export async function sendAffiliatePostbackEvent(input: {
+  destinationUrl: string;
+  method?: AffiliatePostbackMethod;
+  affiliateUserId: string;
+  deliveryId?: string | number;
+  payload: AffiliatePostbackPayload;
+}): Promise<{ status: number; responseExcerpt: string }> {
+  const method = input.method || 'POST';
+  if (method !== 'POST' && method !== 'GET') throw new Error('Postback method must be POST or GET.');
+  const normalized = normalizePostbackTemplate(input.destinationUrl);
+  if (!normalized) throw new Error('Enter a valid public HTTPS postback URL.');
+
+  const stringPayload = toStringValues(input.payload);
+  const renderedUrl = replaceMacros(normalized, stringPayload);
+  if (/\{[a-z_]+\}/i.test(renderedUrl)) throw new Error('The postback URL contains a macro that could not be replaced.');
+  const target = new URL(renderedUrl);
+
+  if (method === 'GET') {
+    for (const [key, value] of Object.entries(stringPayload)) {
+      if (!target.searchParams.has(key)) target.searchParams.set(key, value);
+    }
+  }
+  if (target.toString().length > 2048) throw new Error('The expanded postback URL exceeds 2048 characters.');
+
+  const pinnedAddress = await resolvePublicPostbackAddress(target.toString());
+  const body = JSON.stringify(input.payload);
+  const signature = createHmac('sha256', getAffiliatePostbackSecret(input.affiliateUserId)).update(body).digest('hex');
+  const result = await sendPinnedPostback(target, pinnedAddress, method, input.payload, {
+    'X-Sportrz-Event': String(input.payload.event || 'conversion'),
+    ...(input.deliveryId !== undefined ? { 'X-Sportrz-Delivery-Id': String(input.deliveryId), 'Idempotency-Key': `sportrz-affiliate-${String(input.deliveryId)}` } : {}),
+    'X-Sportrz-Signature': `sha256=${signature}`,
+  });
+
+  if (result.status < 200 || result.status >= 300) {
+    throw Object.assign(new Error(`Partner endpoint returned HTTP ${result.status}. ${result.responseExcerpt}`), { httpStatus: result.status });
+  }
+  return result;
+}
+
 interface DeliveryRow extends RowDataPacket {
   id: number;
   affiliate_user_id: string;
   commission_id: number;
   destination_url: string;
-  delivery_status: string;
+  http_method: AffiliatePostbackMethod;
   commission_status: string;
   commission_paise: number;
   commission_percent: number;
@@ -197,25 +278,26 @@ export async function dispatchAffiliatePostbackDelivery(
 
   try {
     const [rows] = await pool.execute<DeliveryRow[]>(
-      `SELECT d.id, d.affiliate_user_id, d.commission_id, d.destination_url,
-              d.status AS delivery_status, ac.status AS commission_status,
-              ac.commission_paise, ac.commission_percent, ac.amount_paise,
-              p.currency, p.order_id, p.provider_payment_id, p.paid_at,
-              p.created_at AS payment_created_at,
+      `SELECT d.id, d.affiliate_user_id, d.commission_id, d.destination_url, d.http_method,
+              ac.status AS commission_status, ac.commission_paise, ac.commission_percent, ac.amount_paise,
+              p.currency, p.order_id, p.provider_payment_id, p.paid_at, p.created_at AS payment_created_at,
               ap.referral_code, ar.click_id
          FROM affiliate_postback_deliveries d
          JOIN affiliate_commissions ac ON ac.id = d.commission_id
          JOIN payments p ON p.id = ac.payment_record_id
          JOIN affiliate_profiles ap ON ap.user_id = d.affiliate_user_id
-         JOIN affiliate_referrals ar ON ar.referred_user_id = ac.referred_user_id AND ar.affiliate_user_id = d.affiliate_user_id
+         JOIN users au ON au.id = ap.user_id AND au.account_role = 'affiliate' AND au.status = 'active'
+         LEFT JOIN affiliate_referrals ar
+           ON ar.referred_user_id = ac.referred_user_id AND ar.affiliate_user_id = d.affiliate_user_id
         WHERE d.id = ? AND d.affiliate_user_id = ?
         LIMIT 1`,
       [deliveryId, affiliateUserId],
     );
     const delivery = rows[0];
-    if (!delivery) throw new Error('The postback delivery is missing its commission or referral record.');
+    if (!delivery) throw new Error('The postback delivery is missing its commission, payment, or affiliate profile.');
+    if (!delivery.destination_url) throw new Error('No external postback URL is configured for this affiliate.');
 
-    const payload = {
+    const payload: AffiliatePostbackPayload = {
       event: 'conversion',
       commission_id: String(delivery.commission_id),
       affiliate_code: delivery.referral_code,
@@ -232,41 +314,13 @@ export async function dispatchAffiliatePostbackDelivery(
         : new Date(delivery.payment_created_at).toISOString(),
     };
 
-    const rendered = replaceMacros(delivery.destination_url, payload);
-    const target = new URL(rendered);
-    const defaultParams: Record<string, string> = {
-      event: payload.event,
-      commission_id: payload.commission_id,
-      affiliate_code: payload.affiliate_code,
-      click_id: payload.click_id,
-      order_id: payload.order_id,
-      payment_id: payload.payment_id,
-      amount: payload.amount,
-      currency: payload.currency,
-      commission: payload.commission,
-      commission_percent: payload.commission_percent,
-      status: payload.status,
-      occurred_at: payload.occurred_at,
-    };
-    for (const [key, value] of Object.entries(defaultParams)) {
-      if (!target.searchParams.has(key)) target.searchParams.set(key, value);
-    }
-    if (target.toString().length > 2048) throw new Error('The expanded postback URL exceeds 2048 characters.');
-    // Validate the fully expanded callback and pin its resolved public address
-    // for this HTTPS request. Redirects are not followed.
-    const pinnedAddress = await resolvePublicPostbackAddress(target.toString());
-    const signature = createHmac('sha256', getAffiliatePostbackSecret(affiliateUserId))
-      .update(JSON.stringify(payload))
-      .digest('hex');
-    const response = await sendPinnedPostback(target, pinnedAddress, {
-      Accept: 'application/json, text/plain, */*',
-      'X-Sportrz-Event': 'conversion',
-      'X-Sportrz-Delivery-Id': String(delivery.id),
-      'X-Sportrz-Signature': `sha256=${signature}`,
+    const response = await sendAffiliatePostbackEvent({
+      destinationUrl: delivery.destination_url,
+      method: delivery.http_method || 'POST',
+      affiliateUserId,
+      deliveryId: delivery.id,
+      payload,
     });
-    if (response.status < 200 || response.status >= 300) {
-      throw Object.assign(new Error(`Partner endpoint returned HTTP ${response.status}. ${response.responseExcerpt}`), { httpStatus: response.status });
-    }
 
     await pool.execute(
       `UPDATE affiliate_postback_deliveries
@@ -278,24 +332,26 @@ export async function dispatchAffiliatePostbackDelivery(
     return { sent: true, status: response.status };
   } catch (error) {
     const message = error instanceof Error ? error.message.slice(0, 500) : 'Postback request failed.';
-    const httpStatus = typeof error === 'object' && error !== null && 'httpStatus' in error ? Number((error as { httpStatus: unknown }).httpStatus) : null;
+    const httpStatus = typeof error === 'object' && error !== null && 'httpStatus' in error
+      ? Number((error as { httpStatus: unknown }).httpStatus)
+      : null;
     await pool.execute(
       `UPDATE affiliate_postback_deliveries
           SET status = 'failed', http_status = ?, last_error = ?, updated_at = UTC_TIMESTAMP()
         WHERE id = ? AND affiliate_user_id = ?`,
       [Number.isInteger(httpStatus) ? httpStatus : null, message, deliveryId, affiliateUserId],
     );
-    return { sent: false, status: typeof httpStatus === 'number' && Number.isInteger(httpStatus) ? httpStatus : undefined, error: message };
+    return { sent: false, status: Number.isInteger(httpStatus) ? httpStatus as number : undefined, error: message };
   }
 }
 
 export async function dispatchAffiliatePostbacksForPayment(paymentRecordId: number): Promise<void> {
   const [rows] = await getPool().execute<Array<RowDataPacket & { id: number; affiliate_user_id: string }>>(
-    `SELECT id, affiliate_user_id
-       FROM affiliate_postback_deliveries
-      WHERE commission_id IN (SELECT id FROM affiliate_commissions WHERE payment_record_id = ?)
-        AND status IN ('pending','failed')
-      ORDER BY id ASC LIMIT 5`,
+    `SELECT d.id, d.affiliate_user_id
+       FROM affiliate_postback_deliveries d
+       JOIN affiliate_commissions ac ON ac.id = d.commission_id
+      WHERE ac.payment_record_id = ? AND d.status IN ('pending','failed')
+      ORDER BY d.id ASC LIMIT 5`,
     [paymentRecordId],
   );
   for (const row of rows) {

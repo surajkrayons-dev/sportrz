@@ -47,20 +47,43 @@ async function main() {
       throw new Error(`Connected to the database, but the Sportrz schema is incomplete. Missing tables: ${missing.join(', ')}`);
     }
     console.log(`Sportrz schema verified: all ${requiredTables.length} required tables exist.`);
-    const adminTables = ['admin_user_permissions', 'affiliate_profiles', 'affiliate_referrals', 'affiliate_commissions', 'affiliate_applications'];
+    const adminTables = [
+      'admin_user_permissions',
+      'affiliate_profiles',
+      'affiliate_referrals',
+      'affiliate_commissions',
+      'affiliate_applications',
+      'affiliate_clicks',
+      'affiliate_postback_deliveries',
+    ];
     const missingAdmin = [];
     for (const table of adminTables) {
       const [result] = await connection.query('SHOW TABLES LIKE ?', [table]);
       if (!result.length) missingAdmin.push(table);
     }
-    const [roleColumns] = await connection.query("SHOW COLUMNS FROM users LIKE 'account_role'");
-    const [affiliateTypeColumns] = await connection.query("SHOW COLUMNS FROM affiliate_profiles LIKE 'affiliate_type'").catch(() => [[]]);
-    const [websiteUrlColumns] = await connection.query("SHOW COLUMNS FROM affiliate_profiles LIKE 'website_url'").catch(() => [[]]);
-    if (!roleColumns.length || missingAdmin.length || !affiliateTypeColumns.length || !websiteUrlColumns.length) {
-      console.log('Admin extensions are not fully installed. Run: npm run db:migrate:admin');
+
+    const requiredColumns = [
+      ['users', 'account_role'],
+      ['affiliate_profiles', 'affiliate_type'],
+      ['affiliate_profiles', 'website_url'],
+      ['affiliate_profiles', 'postback_url'],
+      ['affiliate_profiles', 'postback_method'],
+      ['affiliate_referrals', 'click_id'],
+      ['affiliate_postback_deliveries', 'http_method'],
+    ];
+    const missingColumns = [];
+    for (const [table, column] of requiredColumns) {
+      if (missingAdmin.includes(table)) continue;
+      const [result] = await connection.query(`SHOW COLUMNS FROM \`${table}\` LIKE ?`, [column]);
+      if (!result.length) missingColumns.push(`${table}.${column}`);
+    }
+
+    if (missingAdmin.length || missingColumns.length) {
+      console.log('Admin / affiliate S2S schema is incomplete. Run: npm run db:migrate:admin');
       if (missingAdmin.length) console.log('Missing admin tables:', missingAdmin.join(', '));
+      if (missingColumns.length) console.log('Missing columns:', missingColumns.join(', '));
     } else {
-      console.log('Admin / sub-admin / affiliate schema verified.');
+      console.log('Admin, affiliate, first-party Click ID, and S2S postback schema verified.');
     }
     const [counts] = await connection.query('SELECT (SELECT COUNT(*) FROM games) AS games, (SELECT COUNT(*) FROM categories WHERE is_active = 1) AS categories');
     console.log('Existing catalog:', counts[0]);

@@ -7,9 +7,11 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "typecheck": "tsc --noEmit",
     "db:check": "node scripts/check-db.js",
     "db:import-games": "node upload-games.js",
-    "db:migrate:admin": "node scripts/migrate-admin.js"
+    "db:migrate:admin": "node scripts/migrate-admin.js",
+    "db:migrate:fresh": "node scripts/migrate-fresh.js"
   },
   "dependencies": {
     "@heroicons/react": "^2.2.0",

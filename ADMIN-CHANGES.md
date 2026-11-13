@@ -12,7 +12,7 @@ This patch was made against `Sportrz-Admin-Control-Center.zip` and preserves the
 - Added visible admin initial-load state and a global top progress indicator for asynchronous admin requests.
 - Affiliate commission ledger entries, per-affiliate totals, per-referred-user revenue, team performance, and dashboard money metrics are currency-grouped (INR/USD/EUR/GBP) and no longer add different currencies into a false INR total.
 - Added two affiliate types: admin-created managed affiliates and external-website partners. External partners can submit a website URL for admin review; after approval they receive their own referral code/profile. The same captured-payment commission pipeline applies to both types.
-- Referral attribution is first-touch and server-side. Existing regular users may be attributed only if they verify through a valid referral link and do not already have an attribution; subsequent links cannot overwrite it.
+- Referral attribution is first-touch and server-side for new registrations. Existing customer accounts are not silently reassigned by visiting a later referral link.
 - Added user create/edit and safe delete actions. Deletion is rejected for accounts with payment, subscription, or affiliate history; admins should suspend those accounts to preserve financial/attribution records.
 - Added category edit/name/order visibility controls and team account suspension/reactivation controls.
 - Added the external affiliate application page and footer navigation link.

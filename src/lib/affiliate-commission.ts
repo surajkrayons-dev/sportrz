@@ -47,8 +47,8 @@ export async function ensureAffiliateCommissionForPayment(
   // The destination is snapshotted so later profile edits do not rewrite history.
   await connection.execute(
     `INSERT IGNORE INTO affiliate_postback_deliveries
-       (affiliate_user_id, commission_id, destination_url, status)
-     SELECT ac.affiliate_user_id, ac.id, ap.postback_url, 'pending'
+       (affiliate_user_id, commission_id, destination_url, http_method, status)
+     SELECT ac.affiliate_user_id, ac.id, ap.postback_url, COALESCE(ap.postback_method, 'POST'), 'pending'
        FROM affiliate_commissions ac
        JOIN affiliate_profiles ap ON ap.user_id = ac.affiliate_user_id
        JOIN users au ON au.id = ap.user_id

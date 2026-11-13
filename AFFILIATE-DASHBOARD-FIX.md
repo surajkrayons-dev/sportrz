@@ -1,26 +1,34 @@
-# Sportrz affiliate commission dashboard fix
+# Sportrz affiliate dashboard, Click ID, and S2S update
 
-## Root cause
+## What changed
 
-The affiliate-only branch of `GET /api/admin/affiliates` selected `ar.click_id` but did not join the `affiliate_referrals` table as `ar`. MySQL therefore rejected the affiliate ledger query. The dashboard summary numbers came from the separate `/api/admin/dashboard` endpoint, so referral/revenue/commission cards could show values while the affiliate's transaction table remained empty. The super-admin ledger used a different query and continued to show the commission.
+- Fixed the affiliate-only commission transaction query so it joins `affiliate_referrals` before reading `click_id`.
+- Added first-party click tracking through `/r/:referralCode`. Sportrz generates a cryptographically random Click ID and stores it in `affiliate_clicks` before redirecting to login.
+- New registrations attach the click to `affiliate_referrals`. Existing accounts are not silently reassigned to a new affiliate.
+- Added admin-managed outgoing S2S postbacks. Super Admin/configured affiliate managers own the HTTPS destination, method, signing secret, test event, and retry actions. Affiliate users only see their own read-only history.
+- Reworked the S2S sender to validate public DNS/IP destinations and connect to the pinned public IP while preserving hostname-based TLS validation. This addresses the earlier `Invalid IP address: undefined` delivery failure.
+- Added request identifiers and idempotency headers, bounded timeouts/response capture, and clearer delivery errors.
+- Kept `affiliate_commissions` as the financial ledger and `affiliate_postback_deliveries` as a separate outbound HTTP delivery log.
+- Improved the affiliate application copy and responsive dashboard/table layouts.
 
-## Changes
+## Required database update
 
-- Added a `LEFT JOIN affiliate_referrals` scoped to both `referred_user_id` and `affiliate_user_id` in the affiliate transaction query. Existing commission entries continue to appear even if click ID is null.
-- Added Click ID and Postback status columns to the external affiliate's latest-commission table. Internal affiliates retain the simpler table.
-- Added a Send action for queued postback deliveries. A pending delivery can now be explicitly dispatched; failed deliveries can be retried.
-- Clarified that `affiliate_postback_deliveries` is the outbound callback history, not the commission ledger.
+Run the additive migration after replacing the project files:
 
-## Important table distinction
+```powershell
+npm run db:migrate:admin
+npm run db:check
+```
 
-- `affiliate_commissions` stores earned commission records. The super-admin screenshot already showed the qualifying ₹1.50 commission in this table.
-- `affiliate_postback_deliveries` stores attempts to call an external tracking endpoint. It remains empty until an external affiliate configures a postback URL. This is expected when the admin row says `Postback: not configured`.
+This migration adds `affiliate_clicks`, the postback method fields, and related schema. It does not delete existing data. Do not use `npm run db:migrate:fresh` for a normal update; that command is destructive.
 
-## Apply the code fix
+## Test the S2S integration
 
-1. Stop the dev server with `Ctrl + C`.
-2. Replace the matching project files from this ZIP (or replace the project using the included files while preserving `.env.local`).
-3. Start the app again with `npm run dev`.
-4. Sign in as the affected affiliate and open `/admin`; the commission row should now include Order ID and Payment ID.
+1. Sign in as Super Admin and open **Admin → Affiliate marketing**.
+2. Edit an active external affiliate.
+3. Set the partner postback destination to a Webhook.site unique HTTPS URL, keep method `POST`, and save the profile.
+4. Close and reopen the edit dialog, then click **Send test event**.
+5. Confirm that Webhook.site receives a `POST` with a JSON body. Opening Webhook.site in a browser creates a `GET` request; that is not the S2S test.
+6. Then test a real conversion with a clean Incognito session, the affiliate `/r/:code` link, a new customer email, and a Razorpay test payment.
 
-No new database migration is required for this query/UI correction. Existing affiliate tables and the commission row are retained.
+Old referrals with a `NULL` Click ID are not assigned a fabricated value. The Click ID must be generated at the actual click, so use the updated `/r/:code` link for new tests.

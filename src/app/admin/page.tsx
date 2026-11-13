@@ -348,7 +348,9 @@ export default function AdminPanel() {
   const [staffForm, setStaffForm] = useState({
     email: "",
     role: "subadmin" as "subadmin" | "affiliate",
+    commissionModel: "plan_purchase",
     commissionPercent: "10",
+    clickRewardRupees: "1.00",
     affiliateType: "admin_created",
     websiteUrl: "",
     permissions: ["dashboard.view", "users.view"] as string[],
@@ -362,6 +364,12 @@ export default function AdminPanel() {
   const [affiliateApplications, setAffiliateApplications] = useState<
     AnyRecord[]
   >([]);
+  const [approvingAffiliateApplication, setApprovingAffiliateApplication] = useState<AnyRecord | null>(null);
+  const [applicationApprovalForm, setApplicationApprovalForm] = useState({
+    commissionModel: "plan_purchase",
+    commissionPercent: "10",
+    clickRewardRupees: "1.00",
+  });
   const [myAffiliate, setMyAffiliate] = useState<AnyRecord | null>(null);
   const [myReferrals, setMyReferrals] = useState<AnyRecord[]>([]);
   const [affiliateCommissions, setAffiliateCommissions] = useState<AnyRecord[]>(
@@ -373,7 +381,7 @@ export default function AdminPanel() {
   const [affiliatePostback, setAffiliatePostback] = useState<AnyRecord | null>(
     null,
   );
-  const [affiliateClickStats, setAffiliateClickStats] = useState({ total: 0, converted: 0 });
+  const [affiliateClickStats, setAffiliateClickStats] = useState({ total: 0, billable: 0, converted: 0 });
   const [plans, setPlans] = useState<AnyRecord[]>([]);
   const [planForm, setPlanForm] = useState<AnyRecord>(defaultPlan);
   const [planGameSearch, setPlanGameSearch] = useState("");
@@ -489,7 +497,7 @@ export default function AdminPanel() {
           setMyReferrals(affiliateData.referrals || []);
           setAffiliateCommissions(affiliateData.commissions || []);
           setAffiliateTransactions(affiliateData.commissionTransactions || []);
-          setAffiliateClickStats(affiliateData.clickStats || { total: 0, converted: 0 });
+          setAffiliateClickStats(affiliateData.clickStats || { total: 0, billable: 0, converted: 0 });
           setAffiliatePostback(postbackData);
         }
       }
@@ -530,7 +538,7 @@ export default function AdminPanel() {
           setMyReferrals(data.referrals || []);
           setAffiliateCommissions(data.commissions || []);
           setAffiliateTransactions(data.commissionTransactions || []);
-          setAffiliateClickStats(data.clickStats || { total: 0, converted: 0 });
+          setAffiliateClickStats(data.clickStats || { total: 0, billable: 0, converted: 0 });
           setAffiliatePostback(postbackData);
         } else {
           setAffiliates(data.affiliates || []);
@@ -727,7 +735,9 @@ export default function AdminPanel() {
                   `${window.location.origin}/r/${myAffiliate.referral_code}`}
               </p>
               <p className="mt-1 text-xs text-slate-500">
-                Commission rate: {Number(myAffiliate.commission_percent || 0)}%
+                Earning model: {(myAffiliate.commission_model || myAffiliate.commissionModel) === "pay_per_click"
+                  ? `${money(Number(myAffiliate.click_reward_paise ?? Number(myAffiliate.clickReward || 0) * 100) / 100)} per valid click`
+                  : `${Number(myAffiliate.commission_percent || 0)}% of eligible captured plan payments`}
                 · Status: {myAffiliate.status}
               </p>
             </div>
@@ -752,7 +762,9 @@ export default function AdminPanel() {
         <div className="mt-7">
           <SectionHeading
             title="My latest commissions"
-            description="Order IDs, payment IDs, sale amounts, and commission values from your own referred customers only."
+            description={(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+            ? "Your valid-click rewards, Click IDs, earning rate, and payout status. Only your own click activity is shown."
+            : "Order IDs, payment IDs, sale amounts, and purchase commissions from your own referred customers only."}
           />
           <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
             <table className="min-w-[1050px] w-full text-left text-sm">
@@ -761,11 +773,11 @@ export default function AdminPanel() {
                   <th className="px-4 py-3">Order ID</th>
                   <th className="px-4 py-3">Customer / plan</th>
                   <th className="px-4 py-3">Payment ID</th>
-                  {myAffiliate?.affiliate_type === "external_website" && (
+                  {(myAffiliate?.affiliate_type === "external_website" || (myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click") && (
                     <th className="px-4 py-3">Click ID</th>
                   )}
                   <th className="px-4 py-3">Sale amount</th>
-                  <th className="px-4 py-3">Rate</th>
+                  <th className="px-4 py-3">Earning rate</th>
                   <th className="px-4 py-3">Your commission</th>
                   <th className="px-4 py-3">Status</th>
                   {myAffiliate?.affiliate_type === "external_website" && (
@@ -782,25 +794,27 @@ export default function AdminPanel() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="font-medium">
-                        {row.referredName || row.referredEmail}
+                        {row.commissionModel === "pay_per_click" ? "Valid click reward" : (row.referredName || row.referredEmail)}
                       </div>
                       <div className="text-xs text-slate-500">
-                        {row.planName} · {row.referredEmail}
+                        {row.commissionModel === "pay_per_click" ? "No customer payment required" : `${row.planName} · ${row.referredEmail}`}
                       </div>
                     </td>
                     <td className="max-w-[180px] break-all px-4 py-3 font-mono text-xs">
                       {row.paymentId || "—"}
                     </td>
-                    {myAffiliate?.affiliate_type === "external_website" && (
+                    {(myAffiliate?.affiliate_type === "external_website" || row.commissionModel === "pay_per_click") && (
                       <td className="max-w-[150px] break-all px-4 py-3 font-mono text-xs">
                         {row.clickId || "—"}
                       </td>
                     )}
                     <td className="px-4 py-3">
-                      {money(row.amount, row.currency)}
+                      {row.commissionModel === "pay_per_click" ? "—" : money(row.amount, row.currency)}
                     </td>
-                    <td className="px-4 py-3">
-                      {Number(row.commissionPercent || 0)}%
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      {row.commissionModel === "pay_per_click"
+                        ? `${money(Number(row.clickReward || 0))} / valid click`
+                        : `${Number(row.commissionPercent || 0)}% of sale`}
                     </td>
                     <td className="px-4 py-3 font-semibold">
                       {money(row.commission, row.currency)}
@@ -810,13 +824,15 @@ export default function AdminPanel() {
                     </td>
                     {myAffiliate?.affiliate_type === "external_website" && (
                       <td className="px-4 py-3">
-                        <StatusPill
-                          value={row.postbackStatus || "not_configured"}
-                        />
-                        {row.postbackHttpStatus != null && (
-                          <div className="mt-1 text-[11px] text-slate-500">
-                            HTTP {row.postbackHttpStatus}
-                          </div>
+                        {row.commissionModel === "pay_per_click" ? (
+                          <span className="text-xs text-slate-500">Not applicable to click rewards</span>
+                        ) : (
+                          <>
+                            <StatusPill value={row.postbackStatus || "not_configured"} />
+                            {row.postbackHttpStatus != null && (
+                              <div className="mt-1 text-[11px] text-slate-500">HTTP {row.postbackHttpStatus}</div>
+                            )}
+                          </>
                         )}
                       </td>
                     )}
@@ -829,15 +845,14 @@ export default function AdminPanel() {
                   <tr>
                     <td
                       colSpan={
-                        myAffiliate?.affiliate_type === "external_website"
-                          ? 10
-                          : 8
+                        8 + (myAffiliate?.affiliate_type === "external_website" || (myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click" ? 1 : 0)
+                          + (myAffiliate?.affiliate_type === "external_website" ? 1 : 0)
                       }
                       className="p-8 text-center text-sm text-slate-500"
                     >
-                      No verified commission transactions yet. Orders appear
-                      here after a referred customer completes a captured
-                      payment.
+                      {(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+                        ? "No valid-click rewards yet. Share your referral link to start generating eligible unique clicks."
+                        : "No verified purchase commissions yet. Orders appear here after a referred customer completes an eligible captured plan payment."}
                     </td>
                   </tr>
                 )}
@@ -1041,7 +1056,7 @@ export default function AdminPanel() {
           </span>
         </div>
         <div className="overflow-x-auto">
-          <table className="min-w-[1050px] w-full text-left text-sm">
+          <table className="min-w-[1180px] w-full text-left text-sm">
             <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
               <tr>
                 <th className="px-5 py-3">User</th>
@@ -1341,7 +1356,9 @@ export default function AdminPanel() {
             {
               email: staffForm.email,
               role: staffForm.role,
+              commissionModel: staffForm.commissionModel,
               commissionPercent: Number(staffForm.commissionPercent),
+              clickRewardRupees: Number(staffForm.clickRewardRupees),
               affiliateType: staffForm.affiliateType,
               websiteUrl: staffForm.websiteUrl,
               permissions: staffForm.permissions.filter((key) =>
@@ -1354,7 +1371,9 @@ export default function AdminPanel() {
             setStaffForm({
               email: "",
               role: "subadmin",
+              commissionModel: "plan_purchase",
               commissionPercent: "10",
+              clickRewardRupees: "1.00",
               affiliateType: "admin_created",
               websiteUrl: "",
               permissions: ["dashboard.view", "users.view"],
@@ -1425,22 +1444,29 @@ export default function AdminPanel() {
             </Field>
           )}
           {staffForm.role === "affiliate" && (
-            <Field label="Commission rate (%)">
-              <input
-                className={inputClass}
-                type="number"
-                min="0"
-                max="100"
-                step="0.25"
-                value={staffForm.commissionPercent}
-                onChange={(e) =>
-                  setStaffForm((s) => ({
-                    ...s,
-                    commissionPercent: e.target.value,
-                  }))
-                }
-              />
-            </Field>
+            <>
+              <Field label="Earning model (admin controlled)">
+                <select
+                  className={inputClass}
+                  value={staffForm.commissionModel}
+                  onChange={(e) => setStaffForm((s) => ({ ...s, commissionModel: e.target.value }))}
+                >
+                  <option value="plan_purchase">Plan purchase — percentage of paid sale</option>
+                  <option value="pay_per_click">Pay per valid click — fixed amount per click</option>
+                </select>
+              </Field>
+              {staffForm.commissionModel === "plan_purchase" ? (
+                <Field label="Commission on captured plan purchase (%)">
+                  <input className={inputClass} type="number" min="0" max="100" step="0.25" value={staffForm.commissionPercent}
+                    onChange={(e) => setStaffForm((s) => ({ ...s, commissionPercent: e.target.value }))} />
+                </Field>
+              ) : (
+                <Field label="Reward per valid click (₹)">
+                  <input className={inputClass} type="number" min="0.01" max="1000" step="0.01" value={staffForm.clickRewardRupees}
+                    onChange={(e) => setStaffForm((s) => ({ ...s, clickRewardRupees: e.target.value }))} />
+                </Field>
+              )}
+            </>
           )}
           {staffForm.role === "affiliate" &&
             staffForm.affiliateType === "external_website" && (
@@ -1458,6 +1484,22 @@ export default function AdminPanel() {
               </Field>
             )}
         </div>
+        {staffForm.role === "affiliate" && (
+          <div className="mt-4 rounded-xl border border-blue-100 bg-blue-50 p-4 text-sm text-blue-950">
+            {staffForm.commissionModel === "plan_purchase" ? (
+              <>
+                <p className="font-semibold">How plan-purchase commission works</p>
+                <p className="mt-1 text-xs leading-5">Only a successfully captured, eligible plan payment earns commission. Example: ₹1,000 plan × 10% = ₹100 commission. Clicks and sign-ups are shown as performance metrics, not paid events.</p>
+              </>
+            ) : (
+              <>
+                <p className="font-semibold">How pay-per-click works</p>
+                <p className="mt-1 text-xs leading-5">A fixed rupee reward is paid per valid unique click, not a percentage of clicks. Example: 100 valid clicks × ₹{Number(staffForm.clickRewardRupees || 0).toFixed(2)} = ₹{(100 * Number(staffForm.clickRewardRupees || 0)).toFixed(2)}. Sportrz pays only the first click per browser, per affiliate, per UTC day; repeat visits are analytics-only.</p>
+              </>
+            )}
+            <p className="mt-2 text-xs font-medium">The affiliate cannot change this model or rate. Only an authorized admin can edit it.</p>
+          </div>
+        )}
         {staffForm.role === "subadmin" && (
           <div className="mt-5">
             <div className="mb-3 text-sm font-semibold text-slate-800">
@@ -1563,6 +1605,11 @@ export default function AdminPanel() {
                           {member.paidReferralCount || 0} converted
                         </div>
                         <div className="text-xs text-slate-500">
+                          Earning model: {member.commissionModel === "pay_per_click"
+                            ? `${money(Number(member.clickReward || 0))} per valid click`
+                            : `${Number(member.commissionPercent || 0)}% per captured plan sale`}
+                        </div>
+                        <div className="text-xs text-slate-500">
                           Commission{" "}
                           {currencyBreakdown(
                             (member.commissionByCurrency || []).map(
@@ -1659,10 +1706,9 @@ export default function AdminPanel() {
                   }
                   : {
                     userId: editingStaff.id,
-                    commissionPercent: Number(
-                      editingStaff.editCommission ??
-                      editingStaff.commissionPercent,
-                    ),
+                    commissionModel: editingStaff.editCommissionModel ?? editingStaff.commissionModel ?? "plan_purchase",
+                    commissionPercent: Number(editingStaff.editCommission ?? editingStaff.commissionPercent ?? 10),
+                    clickRewardRupees: Number(editingStaff.editClickReward ?? editingStaff.clickReward ?? 1),
                     affiliateStatus:
                       editingStaff.editStatus ??
                       editingStaff.affiliateStatus ??
@@ -1742,26 +1788,29 @@ export default function AdminPanel() {
                 })}
               </div>
             ) : (
+              <>
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="Commission rate (%)">
-                  <input
-                    className={inputClass}
-                    type="number"
-                    min="0"
-                    max="100"
-                    step="0.25"
-                    value={
-                      editingStaff.editCommission ??
-                      String(editingStaff.commissionPercent ?? 10)
-                    }
-                    onChange={(e) =>
-                      setEditingStaff((old: any) => ({
-                        ...old,
-                        editCommission: e.target.value,
-                      }))
-                    }
-                  />
+                <Field label="Earning model (admin only)">
+                  <select className={inputClass}
+                    value={editingStaff.editCommissionModel ?? editingStaff.commissionModel ?? "plan_purchase"}
+                    onChange={(e) => setEditingStaff((old: any) => ({ ...old, editCommissionModel: e.target.value }))}>
+                    <option value="plan_purchase">Plan purchase — % of captured sale</option>
+                    <option value="pay_per_click">Pay per valid click — ₹ per click</option>
+                  </select>
                 </Field>
+                {(editingStaff.editCommissionModel ?? editingStaff.commissionModel ?? "plan_purchase") === "plan_purchase" ? (
+                  <Field label="Commission on captured plan purchase (%)">
+                    <input className={inputClass} type="number" min="0" max="100" step="0.25"
+                      value={editingStaff.editCommission ?? String(editingStaff.commissionPercent ?? 10)}
+                      onChange={(e) => setEditingStaff((old: any) => ({ ...old, editCommission: e.target.value }))} />
+                  </Field>
+                ) : (
+                  <Field label="Reward per valid click (₹)">
+                    <input className={inputClass} type="number" min="0.01" max="1000" step="0.01"
+                      value={editingStaff.editClickReward ?? String(editingStaff.clickReward ?? 1)}
+                      onChange={(e) => setEditingStaff((old: any) => ({ ...old, editClickReward: e.target.value }))} />
+                  </Field>
+                )}
                 <Field label="Affiliate status">
                   <select
                     className={inputClass}
@@ -1823,6 +1872,13 @@ export default function AdminPanel() {
                   />
                 </Field>
               </div>
+              <div className="mt-4 rounded-xl border border-blue-100 bg-blue-50 p-4 text-xs leading-5 text-blue-950">
+                {(editingStaff.editCommissionModel ?? editingStaff.commissionModel ?? "plan_purchase") === "plan_purchase"
+                  ? `Example: a ₹1,000 captured plan at ${Number(editingStaff.editCommission ?? editingStaff.commissionPercent ?? 10)}% earns ${money(1000 * Number(editingStaff.editCommission ?? editingStaff.commissionPercent ?? 10) / 100)}. No commission is paid for a click alone.`
+                  : `Example: ${money(Number(editingStaff.editClickReward ?? editingStaff.clickReward ?? 1))} × 100 valid unique clicks = ${money(Number(editingStaff.editClickReward ?? editingStaff.clickReward ?? 1) * 100)}. Repeat visits from the same browser are not paid twice on the same UTC day.`}
+                <span className="mt-1 block font-semibold">Only admins can change the earning model and rate. Previously earned ledger entries are preserved when the model changes.</span>
+              </div>
+              </>
             )}
             <div className="mt-6 flex justify-end gap-2">
               <button
@@ -1847,7 +1903,9 @@ export default function AdminPanel() {
       <>
         <SectionHeading
           title="My affiliate account"
-          description="This dashboard is restricted to your referral profile, your referred customers, your own payment orders, and your commissions."
+          description={(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+            ? "Your dashboard shows your own tracked visits, valid clicks, click rewards, and any customers attributed to your referral link."
+            : "Your dashboard shows your own referred customers, captured plan purchases, attributed revenue, and purchase commissions."}
         />
         <div className="mb-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <div className="rounded-2xl border border-slate-200 bg-white p-5">
@@ -1857,10 +1915,21 @@ export default function AdminPanel() {
             </div>
           </div>
           <div className="rounded-2xl border border-slate-200 bg-white p-5">
-            <div className="text-sm text-slate-500">Commission rate</div>
-            <div className="mt-2 text-2xl font-bold text-slate-950">
-              {Number(myAffiliate?.commission_percent || 0)}%
+            <div className="text-sm text-slate-500">
+              {(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+                ? "Pay per valid click"
+                : "Plan purchase commission"}
             </div>
+            <div className="mt-2 text-2xl font-bold text-slate-950">
+              {(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+                ? `${money(Number(myAffiliate?.click_reward_paise ?? Number(myAffiliate?.clickReward || 0) * 100) / 100)} / click`
+                : `${Number(myAffiliate?.commission_percent || 0)}%`}
+            </div>
+            <p className="mt-1 text-xs leading-5 text-slate-500">
+              {(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+                ? "Paid on eligible unique clicks. Repeat visits from the same browser are not paid again that day."
+                : "Paid only after a referred customer's eligible plan payment is successfully captured."}
+            </p>
           </div>
           <div className="rounded-2xl border border-slate-200 bg-white p-5">
             <div className="text-sm text-slate-500">Account status</div>
@@ -1869,13 +1938,27 @@ export default function AdminPanel() {
             </div>
           </div>
           <div className="rounded-2xl border border-slate-200 bg-white p-5">
-            <div className="text-sm text-slate-500">Tracked clicks</div>
-            <div className="mt-2 text-2xl font-bold text-slate-950">
-              {Number(affiliateClickStats.total || 0).toLocaleString("en-IN")}
-            </div>
-            <p className="mt-1 text-xs text-slate-500">
-              {Number(affiliateClickStats.converted || 0).toLocaleString("en-IN")} attributed sign-ups
-            </p>
+            {(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click" ? (
+              <>
+                <div className="text-sm text-slate-500">Valid / billable clicks</div>
+                <div className="mt-2 text-2xl font-bold text-slate-950">
+                  {Number(affiliateClickStats.billable || 0).toLocaleString("en-IN")}
+                </div>
+                <p className="mt-1 text-xs text-slate-500">
+                  {Number(affiliateClickStats.total || 0).toLocaleString("en-IN")} total visits · {Number(affiliateClickStats.converted || 0).toLocaleString("en-IN")} attributed sign-ups
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="text-sm text-slate-500">Purchase conversion</div>
+                <div className="mt-2 text-2xl font-bold text-slate-950">
+                  {myReferrals.filter((item) => Number(item.capturedPayments || 0) > 0).length.toLocaleString("en-IN")} / {myReferrals.length.toLocaleString("en-IN")}
+                </div>
+                <p className="mt-1 text-xs text-slate-500">
+                  Referred customers with at least one captured payment / total referred customers
+                </p>
+              </>
+            )}
           </div>
         </div>
         <div className="mb-5 rounded-2xl border border-orange-200 bg-orange-50 p-4">
@@ -1887,9 +1970,10 @@ export default function AdminPanel() {
               "Contact admin to enable your affiliate profile."}
           </div>
           <p className="mt-2 text-xs leading-5 text-orange-900/80">
-            Share this link on your approved website. Sportrz records each click
-            and creates its own Click ID automatically. You do not need to edit
-            the link or configure tracking code.
+            Share this link on your approved website. Sportrz creates and records the Click ID automatically; you do not need to edit the link or add tracking code.
+            {(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+              ? ` Your current earning rule is ${money(Number(myAffiliate?.click_reward_paise ?? Number(myAffiliate?.clickReward || 0) * 100) / 100)} for each valid unique click. Only the first click from the same browser for this affiliate in a UTC day is billable; repeat visits remain analytics-only.`
+              : ` Your current earning rule is ${Number(myAffiliate?.commission_percent || 0)}% of eligible plan payments after Razorpay confirms capture.`}
           </p>
           <button
             className={`${btnPrimary} mt-3`}
@@ -1906,15 +1990,16 @@ export default function AdminPanel() {
             <Copy className="h-4 w-4" /> Copy referral link
           </button>
         </div>
-        {myAffiliate?.affiliate_type === "external_website" && (
+        {myAffiliate?.affiliate_type === "external_website" && (myAffiliate?.commission_model || myAffiliate?.commissionModel) !== "pay_per_click" && (
           <div className="mb-7 rounded-2xl border border-slate-200 bg-white p-5">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <h3 className="font-bold text-slate-950">External conversion tracking</h3>
                 <p className="mt-1 max-w-2xl text-sm leading-6 text-slate-600">
-                  Sportrz generates Click IDs, attributes new sign-ups, and sends server-to-server
-                  conversion events after a verified Razorpay payment. Tracking endpoints and retries
-                  are managed securely by the Sportrz admin team.
+                  Sportrz generates first-party Click IDs and records attribution automatically. S2S endpoints and delivery retries are controlled by the Sportrz admin team.
+                  {(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+                    ? " Your selected earning model pays valid clicks; it does not pay an additional plan-purchase commission."
+                    : " Your selected earning model pays a percentage of each eligible plan payment after Razorpay capture."}
                 </p>
               </div>
               <StatusPill value={affiliatePostback?.configured ? "configured" : "not configured"} />
@@ -1928,12 +2013,12 @@ export default function AdminPanel() {
               <div className="rounded-xl bg-slate-50 p-4">
                 <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">S2S postback</div>
                 <div className="mt-1 font-semibold text-slate-900">Managed by Sportrz</div>
-                <p className="mt-1 text-xs leading-5 text-slate-500">You do not need to enter a callback URL, copy a secret, or retry deliveries.</p>
+                <p className="mt-1 text-xs leading-5 text-slate-500">You do not need to enter a callback URL, copy a secret, or retry deliveries. {(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click" ? "Click rewards are recorded internally; purchase commission postbacks are not created for this model." : "Verified plan-purchase commissions can generate signed S2S events."}</p>
               </div>
             </div>
             <div className="mt-5">
               <h4 className="font-semibold text-slate-900">Your postback delivery history</h4>
-              <p className="mt-1 text-xs text-slate-500">Read-only history for conversions attributed to your affiliate account.</p>
+              <p className="mt-1 text-xs text-slate-500">Read-only delivery log. Click-based rewards are shown in the commission ledger; this history is for purchase-conversion postbacks.</p>
               <div className="mt-3 overflow-x-auto rounded-xl border border-slate-200">
                 <table className="min-w-[880px] w-full text-left text-sm">
                   <thead className="bg-slate-50 text-[11px] uppercase text-slate-500">
@@ -1962,7 +2047,9 @@ export default function AdminPanel() {
                     {!(affiliatePostback?.deliveries || []).length && (
                       <tr>
                         <td colSpan={7} className="p-6 text-center text-sm text-slate-500">
-                          No S2S delivery has been logged yet. Your commission ledger remains available below.
+                          {(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+                            ? "No purchase-conversion postbacks are created for the pay-per-valid-click model. Your valid click rewards are listed in the commission ledger below."
+                            : "No S2S delivery has been logged yet. Purchase commissions remain available in the ledger below."}
                         </td>
                       </tr>
                     )}
@@ -1982,7 +2069,7 @@ export default function AdminPanel() {
               <tr>
                 <th className="px-5 py-3">User</th>
                 <th className="px-5 py-3">Joined via link</th>
-                {myAffiliate?.affiliate_type === "external_website" && (
+                {(myAffiliate?.affiliate_type === "external_website" || (myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click") && (
                   <th className="px-5 py-3">Click ID</th>
                 )}
                 <th className="px-5 py-3">Plan</th>
@@ -2002,7 +2089,7 @@ export default function AdminPanel() {
                   <td className="px-5 py-4 whitespace-nowrap">
                     {dateLabel(r.referredAt)}
                   </td>
-                  {myAffiliate?.affiliate_type === "external_website" && (
+                  {(myAffiliate?.affiliate_type === "external_website" || (myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click") && (
                     <td className="max-w-[170px] break-all px-5 py-4 font-mono text-xs">
                       {r.clickId || "—"}
                     </td>
@@ -2020,7 +2107,7 @@ export default function AdminPanel() {
                 <tr>
                   <td
                     colSpan={
-                      myAffiliate?.affiliate_type === "external_website" ? 6 : 5
+                      myAffiliate?.affiliate_type === "external_website" || (myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click" ? 6 : 5
                     }
                     className="p-8 text-center text-slate-500"
                   >
@@ -2034,7 +2121,9 @@ export default function AdminPanel() {
         </div>
         <SectionHeading
           title="Your commission transactions"
-          description="Every attributed order and its payment/commission identifiers. This ledger is scoped to your affiliate account only."
+          description={(myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click"
+            ? "Each row is one eligible unique click reward. Click IDs, fixed reward rate, and payout status are shown for your account only."
+            : "Every eligible captured plan order and its payment/commission identifiers. This ledger is scoped to your affiliate account only."}
         />
         <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
           <table className="min-w-[1150px] w-full text-left text-sm">
@@ -2044,11 +2133,12 @@ export default function AdminPanel() {
                 <th className="px-4 py-3">Customer</th>
                 <th className="px-4 py-3">Plan</th>
                 <th className="px-4 py-3">Payment ID</th>
+                {(myAffiliate?.affiliate_type === "external_website" || (myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click") && <th className="px-4 py-3">Click ID</th>}
                 <th className="px-4 py-3">Sale amount</th>
-                <th className="px-4 py-3">Rate</th>
+                <th className="px-4 py-3">Earning rate</th>
                 <th className="px-4 py-3">Your commission</th>
                 <th className="px-4 py-3">Commission status</th>
-                <th className="px-4 py-3">Postback</th>
+                {myAffiliate?.affiliate_type === "external_website" && <th className="px-4 py-3">Postback</th>}
                 <th className="px-4 py-3">Date</th>
               </tr>
             </thead>
@@ -2059,27 +2149,22 @@ export default function AdminPanel() {
                     {row.orderId || "—"}
                   </td>
                   <td className="px-4 py-3">
-                    <div className="font-medium">
-                      {row.referredName || "Player"}
-                    </div>
-                    <div className="text-xs text-slate-500">
-                      {row.referredEmail}
-                    </div>
+                    {row.commissionModel === "pay_per_click" ? (
+                      <><div className="font-medium">Valid click reward</div><div className="text-xs text-slate-500">No registration required</div></>
+                    ) : (
+                      <><div className="font-medium">{row.referredName || "Player"}</div><div className="text-xs text-slate-500">{row.referredEmail}</div></>
+                    )}
                   </td>
                   <td className="px-4 py-3">
-                    {row.planName}{" "}
-                    <span className="text-xs text-slate-500">
-                      ({row.planCode})
-                    </span>
+                    {row.commissionModel === "pay_per_click" ? "Valid click" : <>{row.planName} <span className="text-xs text-slate-500">({row.planCode})</span></>}
                   </td>
-                  <td className="max-w-[170px] break-all px-4 py-3 font-mono text-xs">
-                    {row.paymentId || "—"}
-                  </td>
-                  <td className="px-4 py-3">
-                    {money(row.amount, row.currency)}
-                  </td>
-                  <td className="px-4 py-3">
-                    {Number(row.commissionPercent || 0)}%
+                  <td className="max-w-[170px] break-all px-4 py-3 font-mono text-xs">{row.paymentId || "—"}</td>
+                  {(myAffiliate?.affiliate_type === "external_website" || row.commissionModel === "pay_per_click") && (
+                    <td className="max-w-[160px] break-all px-4 py-3 font-mono text-xs">{row.clickId || "—"}</td>
+                  )}
+                  <td className="px-4 py-3">{row.commissionModel === "pay_per_click" ? "—" : money(row.amount, row.currency)}</td>
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    {row.commissionModel === "pay_per_click" ? `${money(Number(row.clickReward || 0))} / valid click` : `${Number(row.commissionPercent || 0)}% of sale`}
                   </td>
                   <td className="px-4 py-3 font-semibold">
                     {money(row.commission, row.currency)}
@@ -2087,16 +2172,15 @@ export default function AdminPanel() {
                   <td className="px-4 py-3">
                     <StatusPill value={row.status} />
                   </td>
-                  <td className="px-4 py-3">
-                    <StatusPill
-                      value={row.postbackStatus || "not_configured"}
-                    />
-                    {row.postbackHttpStatus && (
-                      <div className="mt-1 text-xs text-slate-400">
-                        HTTP {row.postbackHttpStatus}
-                      </div>
-                    )}
-                  </td>
+                  {myAffiliate?.affiliate_type === "external_website" && (
+                    <td className="px-4 py-3">
+                      {row.commissionModel === "pay_per_click" ? (
+                        <span className="text-xs text-slate-500">Not applicable to click rewards</span>
+                      ) : (
+                        <><StatusPill value={row.postbackStatus || "not_configured"} />{row.postbackHttpStatus != null && <div className="mt-1 text-xs text-slate-400">HTTP {row.postbackHttpStatus}</div>}</>
+                      )}
+                    </td>
+                  )}
                   <td className="whitespace-nowrap px-4 py-3 text-xs">
                     {dateLabel(row.paidAt || row.createdAt)}
                   </td>
@@ -2104,10 +2188,10 @@ export default function AdminPanel() {
               ))}
               {!affiliateTransactions.length && (
                 <tr>
-                  <td colSpan={10} className="p-8 text-center text-slate-500">
-                    No commission transactions yet. Your first captured referral
-                    payment will appear here with its Razorpay order and payment
-                    IDs.
+                  <td colSpan={9 + (myAffiliate?.affiliate_type === "external_website" || (myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click" ? 1 : 0) + (myAffiliate?.affiliate_type === "external_website" ? 1 : 0)} className="p-8 text-center text-slate-500">
+                    No commission transactions yet. {((myAffiliate?.commission_model || myAffiliate?.commissionModel) === "pay_per_click")
+                      ? "Your first valid click reward will appear here."
+                      : "Your first eligible captured referral payment will appear here with its Razorpay order and payment IDs."}
                   </td>
                 </tr>
               )}
@@ -2123,7 +2207,14 @@ export default function AdminPanel() {
           action={
             <button
               className={btnSecondary}
-              onClick={() => selectSection("team")}
+              onClick={() => {
+                setStaffForm((current) => ({
+                  ...current,
+                  role: "affiliate",
+                  affiliateType: "admin_created",
+                }));
+                selectSection("team");
+              }}
             >
               <UserCog className="h-4 w-4" /> Create affiliate
             </button>
@@ -2131,7 +2222,7 @@ export default function AdminPanel() {
         />
         <SectionHeading
           title={`External website applications (${affiliateApplications.length})`}
-          description="Review external website partners before creating an affiliate profile. Approved partners start at 10% commission; you can adjust the rate afterwards."
+          description="Review each partner, choose one admin-controlled earning model, and set its rate before approval. The affiliate sees only the selected model."
         />
         <div className="mb-6 overflow-x-auto rounded-2xl border border-slate-200 bg-white">
           <table className="min-w-[850px] w-full text-left text-sm">
@@ -2174,20 +2265,12 @@ export default function AdminPanel() {
                         <button
                           disabled={busy}
                           className={btnPrimary}
-                          onClick={() =>
-                            void act(
-                              "/api/admin/affiliates",
-                              "PATCH",
-                              {
-                                applicationId: application.id,
-                                applicationAction: "approve",
-                                commissionPercent: 10,
-                              },
-                              "External affiliate approved at 10%.",
-                            )
-                          }
+                          onClick={() => {
+                            setApplicationApprovalForm({ commissionModel: "plan_purchase", commissionPercent: "10", clickRewardRupees: "1.00" });
+                            setApprovingAffiliateApplication(application);
+                          }}
                         >
-                          Approve · 10%
+                          Review & approve
                         </button>
                       )}
                       {can("affiliates.manage") && (
@@ -2236,14 +2319,90 @@ export default function AdminPanel() {
             </tbody>
           </table>
         </div>
+        {approvingAffiliateApplication && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/50 p-3 sm:p-5">
+            <form
+              className="max-h-[92vh] w-full max-w-xl overflow-y-auto rounded-2xl bg-white p-5 shadow-2xl sm:p-6"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const isClick = applicationApprovalForm.commissionModel === "pay_per_click";
+                const ok = await act(
+                  "/api/admin/affiliates",
+                  "PATCH",
+                  {
+                    applicationId: approvingAffiliateApplication.id,
+                    applicationAction: "approve",
+                    commissionModel: applicationApprovalForm.commissionModel,
+                    commissionPercent: Number(applicationApprovalForm.commissionPercent),
+                    clickRewardRupees: Number(applicationApprovalForm.clickRewardRupees),
+                  },
+                  isClick ? "Affiliate approved with pay-per-valid-click rewards." : "Affiliate approved with plan-purchase commission.",
+                );
+                if (ok) setApprovingAffiliateApplication(null);
+              }}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-bold text-slate-950">Approve external affiliate</h3>
+                  <p className="mt-1 text-sm text-slate-500">{approvingAffiliateApplication.displayName || approvingAffiliateApplication.email} · {approvingAffiliateApplication.email}</p>
+                  <a href={approvingAffiliateApplication.websiteUrl} target="_blank" rel="noreferrer" className="mt-1 inline-block break-all text-xs text-orange-700 underline">{approvingAffiliateApplication.websiteUrl}</a>
+                </div>
+                <button type="button" className="rounded-lg p-2 text-slate-500 hover:bg-slate-100" onClick={() => setApprovingAffiliateApplication(null)}><X className="h-5 w-5" /></button>
+              </div>
+              <div className="mt-5">
+                <Field label="Earning model (controlled by Super Admin)">
+                  <select className={inputClass} value={applicationApprovalForm.commissionModel}
+                    onChange={(e) => setApplicationApprovalForm((old) => ({ ...old, commissionModel: e.target.value }))}>
+                    <option value="plan_purchase">Plan purchase — percentage of captured sale</option>
+                    <option value="pay_per_click">Pay per valid click — fixed ₹ amount per click</option>
+                  </select>
+                </Field>
+              </div>
+              {applicationApprovalForm.commissionModel === "plan_purchase" ? (
+                <div className="mt-4">
+                  <Field label="Commission on captured plan purchase (%)">
+                    <input className={inputClass} type="number" min="0" max="100" step="0.25" required value={applicationApprovalForm.commissionPercent}
+                      onChange={(e) => setApplicationApprovalForm((old) => ({ ...old, commissionPercent: e.target.value }))} />
+                  </Field>
+                </div>
+              ) : (
+                <div className="mt-4">
+                  <Field label="Reward per valid click (₹)">
+                    <input className={inputClass} type="number" min="0.01" max="1000" step="0.01" required value={applicationApprovalForm.clickRewardRupees}
+                      onChange={(e) => setApplicationApprovalForm((old) => ({ ...old, clickRewardRupees: e.target.value }))} />
+                  </Field>
+                </div>
+              )}
+              <div className="mt-4 rounded-xl border border-blue-100 bg-blue-50 p-4 text-sm text-blue-950">
+                {applicationApprovalForm.commissionModel === "plan_purchase" ? (
+                  <>
+                    <p className="font-semibold">Plan-purchase example</p>
+                    <p className="mt-1 text-xs leading-5">If the referred customer pays ₹1,000 and the payment is captured, the affiliate earns {applicationApprovalForm.commissionPercent || 0}% = {money(1000 * Number(applicationApprovalForm.commissionPercent || 0) / 100)}. A click or sign-up alone does not earn commission.</p>
+                  </>
+                ) : (
+                  <>
+                    <p className="font-semibold">Pay-per-click example</p>
+                    <p className="mt-1 text-xs leading-5">100 valid unique clicks × {money(Number(applicationApprovalForm.clickRewardRupees || 0))} = {money(100 * Number(applicationApprovalForm.clickRewardRupees || 0))}. This is a fixed amount per valid click, not a percentage. Repeat visits from the same browser to this affiliate on the same UTC day are not paid again.</p>
+                  </>
+                )}
+                <p className="mt-2 text-xs font-semibold">The affiliate cannot change this earning model or rate. They only see the model selected here.</p>
+              </div>
+              <div className="mt-6 flex flex-wrap justify-end gap-2">
+                <button type="button" className={btnSecondary} onClick={() => setApprovingAffiliateApplication(null)}>Cancel</button>
+                <button type="submit" className={btnPrimary} disabled={busy}><CheckCircle2 className="h-4 w-4" /> Approve affiliate</button>
+              </div>
+            </form>
+          </div>
+        )}
         <div className="overflow-x-auto rounded-2xl border border-slate-200 bg-white">
-          <table className="min-w-[1050px] w-full text-left text-sm">
+          <table className="min-w-[1180px] w-full text-left text-sm">
             <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
               <tr>
                 <th className="px-5 py-3">Affiliate</th>
                 <th className="px-5 py-3">Referral link</th>
-                <th className="px-5 py-3">Rate</th>
-                <th className="px-5 py-3">Clicks</th>
+                <th className="px-5 py-3">Earning model / rate</th>
+                <th className="px-5 py-3">Visits</th>
+                <th className="px-5 py-3">Valid clicks</th>
                 <th className="px-5 py-3">Referrals</th>
                 <th className="px-5 py-3">Conversions</th>
                 <th className="px-5 py-3">Commission</th>
@@ -2278,7 +2437,7 @@ export default function AdminPanel() {
                     {a.affiliateType === "external_website" && (
                       <div className="mt-1 text-xs text-slate-500">
                         Postback:{" "}
-                        {a.postbackConfigured ? "configured" : "not configured"}
+                        {a.commissionModel === "pay_per_click" ? "not used for CPC" : (a.postbackConfigured ? "configured" : "not configured")}
                       </div>
                     )}
                   </td>
@@ -2297,10 +2456,21 @@ export default function AdminPanel() {
                       Copy link
                     </button>
                   </td>
-                  <td className="px-5 py-4">{a.commissionPercent}%</td>
+                  <td className="px-5 py-4">
+                    <div className="font-semibold text-slate-900">{a.commissionModel === "pay_per_click" ? "Pay per valid click" : "Plan purchase"}</div>
+                    <div className="text-xs text-slate-500">{a.commissionModel === "pay_per_click" ? `${money(Number(a.clickReward || 0))} / valid click` : `${Number(a.commissionPercent || 0)}% of captured sale`}</div>
+                  </td>
                   <td className="px-5 py-4">{Number(a.clickCount || 0).toLocaleString("en-IN")}</td>
+                  <td className="px-5 py-4">{Number(a.billableClickCount || 0).toLocaleString("en-IN")}</td>
                   <td className="px-5 py-4">{a.referralCount}</td>
-                  <td className="px-5 py-4">{a.convertedCount}</td>
+                  <td className="px-5 py-4">
+                    <div className="font-semibold">{Number(a.convertedCount || 0).toLocaleString("en-IN")}</div>
+                    <div className="text-xs text-slate-500">
+                      {Number(a.referralCount || 0) > 0
+                        ? `${((Number(a.convertedCount || 0) / Number(a.referralCount || 0)) * 100).toFixed(1)}% of referred users`
+                        : "No referred users yet"}
+                    </div>
+                  </td>
                   <td className="px-5 py-4">
                     {currencyBreakdown(
                       (a.commissionByCurrency || []).map((v: any) => ({
@@ -2328,6 +2498,8 @@ export default function AdminPanel() {
                           setEditingAffiliate({
                             ...a,
                             editCommissionPercent: String(a.commissionPercent),
+                            editCommissionModel: a.commissionModel || "plan_purchase",
+                            editClickReward: String(a.clickReward || 1),
                             editStatus: a.status,
                             editPostbackUrl: a.postbackUrl || "",
                             editPostbackMethod: a.postbackMethod || "POST",
@@ -2344,7 +2516,7 @@ export default function AdminPanel() {
               ))}
               {!affiliates.length && (
                 <tr>
-                  <td colSpan={10} className="p-8 text-center text-slate-500">
+                  <td colSpan={11} className="p-8 text-center text-slate-500">
                     No affiliate profiles created yet. Promote an account from
                     Team & access.
                   </td>
@@ -2364,9 +2536,9 @@ export default function AdminPanel() {
                   "PATCH",
                   {
                     userId: editingAffiliate.userId,
-                    commissionPercent: Number(
-                      editingAffiliate.editCommissionPercent,
-                    ),
+                    commissionModel: editingAffiliate.editCommissionModel ?? editingAffiliate.commissionModel ?? "plan_purchase",
+                    commissionPercent: Number(editingAffiliate.editCommissionPercent ?? editingAffiliate.commissionPercent ?? 10),
+                    clickRewardRupees: Number(editingAffiliate.editClickReward ?? editingAffiliate.clickReward ?? 1),
                     affiliateStatus: editingAffiliate.editStatus,
                     affiliateType:
                       editingAffiliate.editAffiliateType ??
@@ -2398,22 +2570,27 @@ export default function AdminPanel() {
                 </button>
               </div>
               <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="Commission rate (%)">
-                  <input
-                    className={inputClass}
-                    type="number"
-                    min="0"
-                    max="100"
-                    step="0.25"
-                    value={editingAffiliate.editCommissionPercent}
-                    onChange={(e) =>
-                      setEditingAffiliate((old: any) => ({
-                        ...old,
-                        editCommissionPercent: e.target.value,
-                      }))
-                    }
-                  />
+                <Field label="Earning model (admin controlled)">
+                  <select className={inputClass}
+                    value={editingAffiliate.editCommissionModel ?? editingAffiliate.commissionModel ?? "plan_purchase"}
+                    onChange={(e) => setEditingAffiliate((old: any) => ({ ...old, editCommissionModel: e.target.value }))}>
+                    <option value="plan_purchase">Plan purchase — percentage of captured sale</option>
+                    <option value="pay_per_click">Pay per valid click — fixed ₹ amount per click</option>
+                  </select>
                 </Field>
+                {(editingAffiliate.editCommissionModel ?? editingAffiliate.commissionModel ?? "plan_purchase") === "plan_purchase" ? (
+                  <Field label="Commission on captured plan purchase (%)">
+                    <input className={inputClass} type="number" min="0" max="100" step="0.25"
+                      value={editingAffiliate.editCommissionPercent ?? String(editingAffiliate.commissionPercent ?? 10)}
+                      onChange={(e) => setEditingAffiliate((old: any) => ({ ...old, editCommissionPercent: e.target.value }))} />
+                  </Field>
+                ) : (
+                  <Field label="Reward per valid click (₹)">
+                    <input className={inputClass} type="number" min="0.01" max="1000" step="0.01"
+                      value={editingAffiliate.editClickReward ?? String(editingAffiliate.clickReward ?? 1)}
+                      onChange={(e) => setEditingAffiliate((old: any) => ({ ...old, editClickReward: e.target.value }))} />
+                  </Field>
+                )}
                 <Field label="Affiliate status">
                   <select
                     className={inputClass}
@@ -2471,14 +2648,21 @@ export default function AdminPanel() {
                   />
                 </Field>
               </div>
+              <div className="mt-4 rounded-xl border border-blue-100 bg-blue-50 p-4 text-xs leading-5 text-blue-950">
+                {(editingAffiliate.editCommissionModel ?? editingAffiliate.commissionModel ?? "plan_purchase") === "plan_purchase"
+                  ? `Plan-purchase model: an eligible ₹1,000 captured plan at ${Number(editingAffiliate.editCommissionPercent ?? editingAffiliate.commissionPercent ?? 10)}% earns ${money(1000 * Number(editingAffiliate.editCommissionPercent ?? editingAffiliate.commissionPercent ?? 10) / 100)}. Clicks and sign-ups are analytics only.`
+                  : `Pay-per-click model: ${money(Number(editingAffiliate.editClickReward ?? editingAffiliate.clickReward ?? 1))} × 100 valid unique clicks = ${money(Number(editingAffiliate.editClickReward ?? editingAffiliate.clickReward ?? 1) * 100)}. A repeat browser visit to the same affiliate on the same UTC day is not paid twice.`}
+                <span className="mt-1 block font-semibold">The affiliate cannot edit this setting. The selected model applies to future activity; existing commission ledger entries are preserved.</span>
+              </div>
               {(editingAffiliate.editAffiliateType ?? editingAffiliate.affiliateType) === "external_website" && (
                 <div className="mt-6 rounded-2xl border border-orange-200 bg-orange-50/60 p-4 sm:p-5">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
                       <h4 className="font-bold text-slate-900">Server-to-server (S2S) postback</h4>
                       <p className="mt-1 text-xs leading-5 text-slate-600">
-                        Configure the receiving HTTPS endpoint here. Sportrz sends a signed JSON POST after a captured payment.
-                        Affiliates cannot view or change this destination.
+                        {(editingAffiliate.editCommissionModel ?? editingAffiliate.commissionModel ?? "plan_purchase") === "pay_per_click"
+                          ? "This affiliate is currently paid per valid click. Purchase-commission postbacks are paused for new activity while this model is selected; existing purchase deliveries remain in the history."
+                          : "Configure the receiving HTTPS endpoint here. Sportrz sends a signed JSON POST after a verified captured plan payment. Affiliates cannot view or change this destination."}
                       </p>
                     </div>
                     <StatusPill value={editingAffiliate.postbackConfigured ? "configured" : "not configured"} />
@@ -2573,7 +2757,7 @@ export default function AdminPanel() {
                 <th className="px-5 py-3">Referred customer</th>
                 <th className="px-5 py-3">Payment / order</th>
                 <th className="px-5 py-3">Click ID</th>
-                <th className="px-5 py-3">Rate</th>
+                <th className="px-5 py-3">Earning rate</th>
                 <th className="px-5 py-3">Commission</th>
                 <th className="px-5 py-3">Status</th>
                 <th className="px-5 py-3">S2S postback</th>
@@ -2590,21 +2774,23 @@ export default function AdminPanel() {
                       {c.affiliateName ? c.affiliateEmail : ""}
                     </div>
                   </td>
-                  <td className="px-5 py-4">{c.referredEmail}</td>
+                  <td className="px-5 py-4">{c.commissionModel === "pay_per_click" ? <span className="text-slate-500">Valid click (no sign-up required)</span> : c.referredEmail || "—"}</td>
                   <td className="px-5 py-4">
-                    <div className="break-all font-mono text-xs">
-                      Order: {c.orderId || "—"}
-                    </div>
-                    <div className="mt-1 break-all font-mono text-[11px] text-slate-500">
-                      Payment: {c.paymentId || "—"}
-                    </div>
-                    <div className="mt-1 text-xs text-slate-500">
-                      Record #{c.paymentRecordId} · {c.planName || "Plan"} ·{" "}
-                      {money(c.amount, c.currency)}
-                    </div>
+                    {c.commissionModel === "pay_per_click" ? (
+                      <>
+                        <div className="text-xs font-semibold">Valid click reward</div>
+                        <div className="mt-1 text-[11px] text-slate-500">No customer payment or order is required for this earning model.</div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="break-all font-mono text-xs">Order: {c.orderId || "—"}</div>
+                        <div className="mt-1 break-all font-mono text-[11px] text-slate-500">Payment: {c.paymentId || "—"}</div>
+                        <div className="mt-1 text-xs text-slate-500">Record #{c.paymentRecordId} · {c.planName || "Plan"} · {money(c.amount, c.currency)}</div>
+                      </>
+                    )}
                   </td>
                   <td className="max-w-[160px] break-all px-5 py-4 font-mono text-xs">{c.clickId || "—"}</td>
-                  <td className="px-5 py-4">{c.commissionPercent}%</td>
+                  <td className="px-5 py-4 whitespace-nowrap">{c.commissionModel === "pay_per_click" ? `${money(Number(c.clickReward || 0))} / valid click` : `${Number(c.commissionPercent || 0)}% of sale`}</td>
                   <td className="px-5 py-4 font-semibold">
                     {money(c.commission, c.currency)}
                   </td>
@@ -2612,11 +2798,15 @@ export default function AdminPanel() {
                     <StatusPill value={c.status} />
                   </td>
                   <td className="px-5 py-4">
-                    <StatusPill value={c.postbackStatus || "not_configured"} />
-                    <div className="mt-1 text-xs text-slate-500">
-                      {c.postbackAttempts || 0} attempt(s) · HTTP {c.postbackHttpStatus ?? "—"}
-                    </div>
-                    {c.postbackDeliveryId && ["pending", "failed"].includes(c.postbackStatus) && (
+                    {c.commissionModel === "pay_per_click" ? (
+                      <span className="text-xs text-slate-500">Not applicable to click rewards</span>
+                    ) : (
+                      <>
+                        <StatusPill value={c.postbackStatus || "not_configured"} />
+                        <div className="mt-1 text-xs text-slate-500">{c.postbackAttempts || 0} attempt(s) · HTTP {c.postbackHttpStatus ?? "—"}</div>
+                      </>
+                    )}
+                    {c.commissionModel !== "pay_per_click" && c.postbackDeliveryId && ["pending", "failed"].includes(c.postbackStatus) && (
                       <button
                         type="button"
                         className="mt-2 text-xs font-semibold text-orange-700 underline disabled:opacity-50"
@@ -2688,8 +2878,7 @@ export default function AdminPanel() {
               {!commissionLedger.length && (
                 <tr>
                   <td colSpan={10} className="p-8 text-center text-slate-500">
-                    No commission records yet. A commission is created after a
-                    referred user's payment is captured and verified.
+                    No commission records yet. Plan-purchase rewards are created after a referred customer's payment is captured; click rewards are created after an eligible unique click.
                   </td>
                 </tr>
               )}

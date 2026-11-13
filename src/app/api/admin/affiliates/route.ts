@@ -57,10 +57,10 @@ export async function GET() {
     // request parameter can be used to read another affiliate's information.
     if (actor.isAffiliate) {
       const [profileRows] = await pool.execute<Array<RowDataPacket & {
-        referral_code: string; commission_percent: number; status: string;
+        referral_code: string; commission_percent: number; commission_model: string; click_reward_paise: number; status: string;
         payout_email: string | null; affiliate_type: string; website_url: string | null;
       }>>(
-        `SELECT ap.referral_code, ap.commission_percent, ap.status, ap.payout_email,
+        `SELECT ap.referral_code, ap.commission_percent, ap.commission_model, ap.click_reward_paise, ap.status, ap.payout_email,
                 ap.affiliate_type, ap.website_url
            FROM affiliate_profiles ap
            JOIN users u ON u.id = ap.user_id
@@ -112,32 +112,35 @@ export async function GET() {
       const [commissionRows] = await pool.execute<Array<RowDataPacket & {
         status: string; currency: string; total_paise: number; count: number;
       }>>(
-        `SELECT ac.status, p.currency, SUM(ac.commission_paise) AS total_paise, COUNT(*) AS count
+        `SELECT ac.status, COALESCE(p.currency, 'INR') AS currency, SUM(ac.commission_paise) AS total_paise, COUNT(*) AS count
            FROM affiliate_commissions ac
-           JOIN payments p ON p.id = ac.payment_record_id
+           LEFT JOIN payments p ON p.id = ac.payment_record_id
           WHERE ac.affiliate_user_id = ?
-          GROUP BY ac.status, p.currency
-          ORDER BY ac.status, p.currency`,
+          GROUP BY ac.status, COALESCE(p.currency, 'INR')
+          ORDER BY ac.status, COALESCE(p.currency, 'INR')`,
         [actor.id],
       );
 
       const [commissionTransactions] = await pool.execute<Array<RowDataPacket & {
-        id: number; referred_email: string; referred_name: string | null; plan_name: string;
-        plan_code: string; click_id: string | null; order_id: string; provider_payment_id: string | null;
-        amount_paise: number; commission_percent: number; commission_paise: number; currency: string;
+        id: number; referred_email: string | null; referred_name: string | null; plan_name: string;
+        plan_code: string; click_id: string | null; order_id: string | null; provider_payment_id: string | null;
+        amount_paise: number; commission_percent: number; commission_model: string; rate_paise: number | null; commission_paise: number; currency: string;
         status: string; paid_at: Date | string | null; created_at: Date | string;
         postback_status: string | null; postback_http_status: number | null; postback_attempts: number | null;
       }>>(
         `SELECT ac.id, ru.email AS referred_email, ru.display_name AS referred_name,
-                pl.name AS plan_name, pl.code AS plan_code, ar.click_id,
+                COALESCE(pl.name, 'Valid click') AS plan_name, COALESCE(pl.code, 'CPC') AS plan_code,
+                COALESCE(ar.click_id, c.click_id) AS click_id,
                 p.order_id, p.provider_payment_id, ac.amount_paise, ac.commission_percent,
-                ac.commission_paise, p.currency, ac.status, p.paid_at, ac.created_at,
+                ac.commission_model, ac.rate_paise, ac.commission_paise, COALESCE(p.currency, 'INR') AS currency,
+                ac.status, p.paid_at, ac.created_at,
                 d.status AS postback_status, d.http_status AS postback_http_status,
                 d.attempt_count AS postback_attempts
            FROM affiliate_commissions ac
-           JOIN payments p ON p.id = ac.payment_record_id
-           JOIN plans pl ON pl.id = p.plan_id
-           JOIN users ru ON ru.id = ac.referred_user_id
+           LEFT JOIN payments p ON p.id = ac.payment_record_id
+           LEFT JOIN plans pl ON pl.id = p.plan_id
+           LEFT JOIN users ru ON ru.id = ac.referred_user_id
+           LEFT JOIN affiliate_clicks c ON c.id = ac.click_record_id
            LEFT JOIN affiliate_referrals ar
              ON ar.referred_user_id = ac.referred_user_id AND ar.affiliate_user_id = ac.affiliate_user_id
            LEFT JOIN affiliate_postback_deliveries d ON d.commission_id = ac.id
@@ -147,8 +150,9 @@ export async function GET() {
         [actor.id],
       );
 
-      const [[clickStats]] = await pool.execute<Array<RowDataPacket & { total: number; converted: number }>>(
+      const [[clickStats]] = await pool.execute<Array<RowDataPacket & { total: number; billable: number; converted: number }>>(
         `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN is_billable = 1 THEN 1 ELSE 0 END) AS billable,
                 SUM(CASE WHEN referred_user_id IS NOT NULL THEN 1 ELSE 0 END) AS converted
            FROM affiliate_clicks WHERE affiliate_user_id = ?`,
         [actor.id],
@@ -158,6 +162,8 @@ export async function GET() {
         affiliate: {
           ...profile,
           commission_percent: Number(profile.commission_percent),
+          commission_model: profile.commission_model || 'plan_purchase',
+          click_reward_paise: Number(profile.click_reward_paise || 0),
           referral_url: buildAffiliateReferralUrl(profile.referral_code),
         },
         referrals: referrals.map((row) => ({
@@ -174,32 +180,34 @@ export async function GET() {
           clickId: row.click_id || '', planName: row.plan_name, planCode: row.plan_code,
           orderId: row.order_id, paymentId: row.provider_payment_id || '',
           amount: Number(row.amount_paise || 0) / 100, currency: row.currency || 'INR',
-          commissionPercent: Number(row.commission_percent || 0), commission: Number(row.commission_paise || 0) / 100,
+          commissionPercent: Number(row.commission_percent || 0), commissionModel: row.commission_model || 'plan_purchase',
+          clickReward: Number(row.rate_paise || 0) / 100, commission: Number(row.commission_paise || 0) / 100,
           status: row.status, paidAt: row.paid_at, createdAt: row.created_at,
           postbackStatus: row.postback_status || 'not_configured',
           postbackHttpStatus: row.postback_http_status == null ? null : Number(row.postback_http_status),
           postbackAttempts: Number(row.postback_attempts || 0),
         })),
-        clickStats: { total: Number(clickStats?.total || 0), converted: Number(clickStats?.converted || 0) },
+        clickStats: { total: Number(clickStats?.total || 0), billable: Number(clickStats?.billable || 0), converted: Number(clickStats?.converted || 0) },
         scope: 'own-referrals-only',
       }, { headers: { 'Cache-Control': 'no-store' } });
     }
 
     const [rows] = await pool.query<Array<RowDataPacket & {
       user_id: string; email: string; display_name: string | null; referral_code: string;
-      commission_percent: number; affiliate_status: string; affiliate_type: string; website_url: string | null;
+      commission_percent: number; commission_model: string; click_reward_paise: number; affiliate_status: string; affiliate_type: string; website_url: string | null;
       postback_url: string | null; postback_method: AffiliatePostbackMethod | null;
-      created_at: Date | string; referral_count: number; converted_count: number; click_count: number;
+      created_at: Date | string; referral_count: number; converted_count: number; click_count: number; billable_click_count: number;
     }>>(
       `SELECT u.id AS user_id, u.email, u.display_name, ap.referral_code, ap.commission_percent,
-              ap.status AS affiliate_status, ap.affiliate_type, ap.website_url,
+              ap.commission_model, ap.click_reward_paise, ap.status AS affiliate_status, ap.affiliate_type, ap.website_url,
               ap.postback_url, ap.postback_method, ap.created_at,
               (SELECT COUNT(*) FROM affiliate_referrals ar WHERE ar.affiliate_user_id = ap.user_id AND ar.status = 'qualified') AS referral_count,
               (SELECT COUNT(DISTINCT ar.referred_user_id) FROM affiliate_referrals ar
                 JOIN payments p ON p.user_id = ar.referred_user_id AND p.status = 'captured'
                 WHERE ar.affiliate_user_id = ap.user_id AND ar.status = 'qualified'
                   AND COALESCE(p.paid_at, p.created_at) >= ar.created_at) AS converted_count,
-              (SELECT COUNT(*) FROM affiliate_clicks c WHERE c.affiliate_user_id = ap.user_id) AS click_count
+              (SELECT COUNT(*) FROM affiliate_clicks c WHERE c.affiliate_user_id = ap.user_id) AS click_count,
+              (SELECT COUNT(*) FROM affiliate_clicks c WHERE c.affiliate_user_id = ap.user_id AND c.is_billable = 1) AS billable_click_count
          FROM affiliate_profiles ap
          JOIN users u ON u.id = ap.user_id
         WHERE u.account_role = 'affiliate'
@@ -209,12 +217,12 @@ export async function GET() {
     const [totals] = await pool.query<Array<RowDataPacket & {
       affiliate_user_id: string; currency: string; total_paise: number; pending_paise: number;
     }>>(
-      `SELECT ac.affiliate_user_id, p.currency,
+      `SELECT ac.affiliate_user_id, COALESCE(p.currency, 'INR') AS currency,
               SUM(CASE WHEN ac.status <> 'reversed' THEN ac.commission_paise ELSE 0 END) AS total_paise,
               SUM(CASE WHEN ac.status IN ('pending','approved') THEN ac.commission_paise ELSE 0 END) AS pending_paise
          FROM affiliate_commissions ac
-         JOIN payments p ON p.id = ac.payment_record_id
-        GROUP BY ac.affiliate_user_id, p.currency`,
+         LEFT JOIN payments p ON p.id = ac.payment_record_id
+        GROUP BY ac.affiliate_user_id, COALESCE(p.currency, 'INR')`,
     );
     const totalsMap = new Map<string, Array<{ currency: string; total: number; pending: number }>>();
     for (const row of totals) {
@@ -224,25 +232,26 @@ export async function GET() {
     }
 
     const [ledgerRows] = await pool.query<Array<RowDataPacket & {
-      id: number; affiliate_email: string; affiliate_name: string | null; referred_email: string;
-      amount_paise: number; commission_percent: number; commission_paise: number; currency: string;
-      status: string; payment_record_id: number; order_id: string; provider_payment_id: string | null;
+      id: number; affiliate_email: string; affiliate_name: string | null; referred_email: string | null;
+      amount_paise: number; commission_percent: number; commission_model: string; rate_paise: number | null; commission_paise: number; currency: string;
+      status: string; payment_record_id: number | null; order_id: string | null; provider_payment_id: string | null;
       plan_name: string; paid_at: Date | string | null; created_at: Date | string;
       click_id: string | null; postback_delivery_id: number | null; postback_status: string | null;
       postback_http_status: number | null; postback_attempts: number | null; postback_error: string | null;
     }>>(
       `SELECT ac.id, au.email AS affiliate_email, au.display_name AS affiliate_name,
-              ru.email AS referred_email, ac.amount_paise, ac.commission_percent,
-              ac.commission_paise, p.currency, ac.status, ac.payment_record_id,
-              p.order_id, p.provider_payment_id, pl.name AS plan_name, p.paid_at, ac.created_at,
-              ar.click_id, d.id AS postback_delivery_id, d.status AS postback_status,
+              ru.email AS referred_email, ac.amount_paise, ac.commission_percent, ac.commission_model, ac.rate_paise,
+              ac.commission_paise, COALESCE(p.currency, 'INR') AS currency, ac.status, ac.payment_record_id,
+              p.order_id, p.provider_payment_id, COALESCE(pl.name, 'Valid click') AS plan_name, p.paid_at, ac.created_at,
+              COALESCE(ar.click_id, c.click_id) AS click_id, d.id AS postback_delivery_id, d.status AS postback_status,
               d.http_status AS postback_http_status, d.attempt_count AS postback_attempts,
               d.last_error AS postback_error
          FROM affiliate_commissions ac
-         JOIN payments p ON p.id = ac.payment_record_id
-         JOIN plans pl ON pl.id = p.plan_id
+         LEFT JOIN payments p ON p.id = ac.payment_record_id
+         LEFT JOIN plans pl ON pl.id = p.plan_id
          JOIN users au ON au.id = ac.affiliate_user_id
-         JOIN users ru ON ru.id = ac.referred_user_id
+         LEFT JOIN users ru ON ru.id = ac.referred_user_id
+         LEFT JOIN affiliate_clicks c ON c.id = ac.click_record_id
          LEFT JOIN affiliate_referrals ar
            ON ar.referred_user_id = ac.referred_user_id AND ar.affiliate_user_id = ac.affiliate_user_id
          LEFT JOIN affiliate_postback_deliveries d ON d.commission_id = ac.id
@@ -274,8 +283,9 @@ export async function GET() {
         postbackUrl: canManageAffiliateSettings ? row.postback_url || '' : '',
         postbackMethod: row.postback_method || 'POST',
         postbackConfigured: Boolean(row.postback_url), postbackSecret,
-        commissionPercent: Number(row.commission_percent), status: row.affiliate_status, createdAt: row.created_at,
-        clickCount: Number(row.click_count || 0), referralCount: Number(row.referral_count || 0),
+        commissionPercent: Number(row.commission_percent), commissionModel: row.commission_model || 'plan_purchase',
+        clickReward: Number(row.click_reward_paise || 0) / 100, status: row.affiliate_status, createdAt: row.created_at,
+        clickCount: Number(row.click_count || 0), billableClickCount: Number(row.billable_click_count || 0), referralCount: Number(row.referral_count || 0),
         convertedCount: Number(row.converted_count || 0), commissionByCurrency: totalsMap.get(row.user_id) || [],
         referralUrl: buildAffiliateReferralUrl(row.referral_code),
       };
@@ -285,11 +295,12 @@ export async function GET() {
       affiliates,
       commissionLedger: ledgerRows.map((row) => ({
         id: Number(row.id), affiliateEmail: row.affiliate_email, affiliateName: row.affiliate_name || '',
-        referredEmail: row.referred_email, amount: Number(row.amount_paise || 0) / 100,
+        referredEmail: row.referred_email || '', amount: Number(row.amount_paise || 0) / 100,
         currency: row.currency || 'INR', commissionPercent: Number(row.commission_percent || 0),
+        commissionModel: row.commission_model || 'plan_purchase', clickReward: Number(row.rate_paise || 0) / 100,
         commission: Number(row.commission_paise || 0) / 100, status: row.status,
-        paymentRecordId: Number(row.payment_record_id), orderId: row.order_id,
-        paymentId: row.provider_payment_id || '', planName: row.plan_name,
+        paymentRecordId: row.payment_record_id == null ? null : Number(row.payment_record_id), orderId: row.order_id || '',
+        paymentId: row.provider_payment_id || '', planName: row.plan_name || 'Valid click',
         paidAt: row.paid_at, createdAt: row.created_at, clickId: row.click_id || '',
         postbackDeliveryId: row.postback_delivery_id == null ? null : Number(row.postback_delivery_id),
         postbackStatus: row.postback_status || 'not_configured',
@@ -328,8 +339,17 @@ export async function PATCH(request: NextRequest) {
         return NextResponse.json({ error: 'Choose a valid affiliate application action.' }, { status: 400 });
       }
       const commissionPercent = body.commissionPercent === undefined ? 10 : Number(body.commissionPercent);
-      if (applicationAction === 'approve' && (!Number.isFinite(commissionPercent) || commissionPercent < 0 || commissionPercent > 100)) {
-        return NextResponse.json({ error: 'Commission must be between 0 and 100 percent.' }, { status: 400 });
+      const commissionModel = String(body.commissionModel || 'plan_purchase');
+      const clickRewardRupees = Number(body.clickRewardRupees ?? 1);
+      const clickRewardPaise = Math.round(clickRewardRupees * 100);
+      if (applicationAction === 'approve' && !['plan_purchase', 'pay_per_click'].includes(commissionModel)) {
+        return NextResponse.json({ error: 'Choose Plan purchase or Pay per valid click.' }, { status: 400 });
+      }
+      if (applicationAction === 'approve' && commissionModel === 'plan_purchase' && (!Number.isFinite(commissionPercent) || commissionPercent < 0 || commissionPercent > 100)) {
+        return NextResponse.json({ error: 'Plan-purchase commission must be between 0 and 100 percent.' }, { status: 400 });
+      }
+      if (applicationAction === 'approve' && commissionModel === 'pay_per_click' && (!Number.isFinite(clickRewardRupees) || clickRewardRupees <= 0 || clickRewardRupees > 1000)) {
+        return NextResponse.json({ error: 'Enter a reward greater than ₹0 and no more than ₹1,000 per valid click.' }, { status: 400 });
       }
 
       connection = await getPool().getConnection();
@@ -376,9 +396,10 @@ export async function PATCH(request: NextRequest) {
       await connection.execute('DELETE FROM admin_user_permissions WHERE user_id = ?', [application.user_id]);
       await connection.execute(
         `INSERT INTO affiliate_profiles
-           (user_id, referral_code, commission_percent, payout_email, status, affiliate_type, website_url, postback_method)
-         VALUES (?, ?, ?, ?, 'active', 'external_website', ?, 'POST')`,
-        [application.user_id, code, commissionPercent, application.email, application.website_url],
+           (user_id, referral_code, commission_percent, commission_model, click_reward_paise,
+            payout_email, status, affiliate_type, website_url, postback_method)
+         VALUES (?, ?, ?, ?, ?, ?, 'active', 'external_website', ?, 'POST')`,
+        [application.user_id, code, commissionPercent, commissionModel, commissionModel === 'pay_per_click' ? clickRewardPaise : 0, application.email, application.website_url],
       );
       await connection.execute(
         `UPDATE affiliate_applications SET status = 'approved', review_note = NULL,
@@ -388,7 +409,8 @@ export async function PATCH(request: NextRequest) {
       );
       await connection.commit();
       await logAdminAction(actor.id, 'affiliate.application_approved', 'affiliate_application', applicationId, {
-        userId: application.user_id, websiteUrl: application.website_url, commissionPercent, referralCode: code,
+        userId: application.user_id, websiteUrl: application.website_url, commissionModel,
+        commissionPercent, clickRewardRupees, referralCode: code,
       }, request);
       return NextResponse.json({ success: true, message: 'Affiliate approved. A first-party tracking link is ready in their dashboard.' });
     }
@@ -399,10 +421,10 @@ export async function PATCH(request: NextRequest) {
 
       const pool = getPool();
       const [profiles] = await pool.execute<Array<RowDataPacket & {
-        commission_percent: number; status: string; affiliate_type: string; website_url: string | null;
+        commission_percent: number; commission_model: string; click_reward_paise: number; status: string; affiliate_type: string; website_url: string | null;
         postback_url: string | null; postback_method: AffiliatePostbackMethod | null;
       }>>(
-        `SELECT ap.commission_percent, ap.status, ap.affiliate_type, ap.website_url,
+        `SELECT ap.commission_percent, ap.commission_model, ap.click_reward_paise, ap.status, ap.affiliate_type, ap.website_url,
                 ap.postback_url, ap.postback_method
            FROM affiliate_profiles ap
            JOIN users u ON u.id = ap.user_id
@@ -415,8 +437,19 @@ export async function PATCH(request: NextRequest) {
 
       const commissionPercent = body.commissionPercent === undefined ? Number(profile.commission_percent) : Number(body.commissionPercent);
       if (!Number.isFinite(commissionPercent) || commissionPercent < 0 || commissionPercent > 100) {
-        return NextResponse.json({ error: 'Commission must be between 0 and 100 percent.' }, { status: 400 });
+        return NextResponse.json({ error: 'Purchase commission must be between 0 and 100 percent.' }, { status: 400 });
       }
+      const commissionModel = String(body.commissionModel ?? profile.commission_model ?? 'plan_purchase');
+      if (!['plan_purchase', 'pay_per_click'].includes(commissionModel)) {
+        return NextResponse.json({ error: 'Choose Plan purchase or Pay per valid click.' }, { status: 400 });
+      }
+      const clickRewardRupees = body.clickRewardRupees === undefined
+        ? Number(profile.click_reward_paise || 0) / 100
+        : Number(body.clickRewardRupees);
+      if (!Number.isFinite(clickRewardRupees) || clickRewardRupees < 0 || clickRewardRupees > 1000 || (commissionModel === 'pay_per_click' && clickRewardRupees <= 0)) {
+        return NextResponse.json({ error: 'Enter a click reward greater than ₹0 and no more than ₹1,000 per valid click.' }, { status: 400 });
+      }
+      const clickRewardPaise = Math.round(clickRewardRupees * 100);
       const affiliateStatus = body.affiliateStatus === undefined ? profile.status : String(body.affiliateStatus);
       if (!['active', 'paused'].includes(affiliateStatus)) return NextResponse.json({ error: 'Affiliate status must be active or paused.' }, { status: 400 });
       const affiliateType = body.affiliateType === undefined ? profile.affiliate_type : String(body.affiliateType);
@@ -446,10 +479,10 @@ export async function PATCH(request: NextRequest) {
       await connection.beginTransaction();
       await connection.execute(
         `UPDATE affiliate_profiles
-            SET commission_percent = ?, status = ?, affiliate_type = ?, website_url = ?,
+            SET commission_percent = ?, commission_model = ?, click_reward_paise = ?, status = ?, affiliate_type = ?, website_url = ?,
                 postback_url = ?, postback_method = ?, updated_at = UTC_TIMESTAMP()
           WHERE user_id = ?`,
-        [commissionPercent, affiliateStatus, affiliateType, websiteUrl, postbackUrl || null, postbackMethod, userId],
+        [commissionPercent, commissionModel, clickRewardPaise, affiliateStatus, affiliateType, websiteUrl, postbackUrl || null, postbackMethod, userId],
       );
 
       if (postbackUrl && affiliateStatus === 'active' && affiliateType === 'external_website') {
@@ -460,7 +493,7 @@ export async function PATCH(request: NextRequest) {
              (affiliate_user_id, commission_id, destination_url, http_method, status)
            SELECT ac.affiliate_user_id, ac.id, ?, ?, 'pending'
              FROM affiliate_commissions ac
-            WHERE ac.affiliate_user_id = ? AND ac.status <> 'reversed'`,
+            WHERE ac.affiliate_user_id = ? AND ac.status <> 'reversed' AND ac.commission_model = 'plan_purchase' AND ac.payment_record_id IS NOT NULL`,
           [postbackUrl, postbackMethod, userId],
         );
         await connection.execute(
@@ -482,7 +515,7 @@ export async function PATCH(request: NextRequest) {
       await connection.commit();
 
       await logAdminAction(actor.id, 'affiliate.profile_updated', 'affiliate_profile', userId, {
-        commissionPercent, status: affiliateStatus, affiliateType, websiteUrl,
+        commissionPercent, commissionModel, clickRewardRupees, status: affiliateStatus, affiliateType, websiteUrl,
         postbackConfigured: Boolean(postbackUrl), postbackMethod,
       }, request);
       return NextResponse.json({ success: true, message: 'Affiliate profile and S2S settings updated.' });

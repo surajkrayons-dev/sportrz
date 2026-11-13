@@ -15,6 +15,7 @@ async function main() {
     path.join(projectRoot, 'database', 'migrations', '20261029_external_affiliate_program.sql'),
     path.join(projectRoot, 'database', 'migrations', '20261109_affiliate_postback_and_ledger.sql'),
     path.join(projectRoot, 'database', 'migrations', '20261110_affiliate_click_tracking_s2s_admin.sql'),
+    path.join(projectRoot, 'database', 'migrations', '20261113_affiliate_commission_models.sql'),
   ];
   for (const migrationPath of migrationPaths) {
     if (!fs.existsSync(migrationPath)) throw new Error(`Migration file not found: ${migrationPath}`);

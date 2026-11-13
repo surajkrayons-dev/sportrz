@@ -20,10 +20,10 @@ export async function GET() {
     if (!actor || (!actor.isSuperAdmin && !hasPermission(actor, 'staff.manage'))) return NextResponse.json({ error: 'Team access required.' }, { status: 403 });
     const [rows] = await getPool().query<Array<RowDataPacket & {
       id: string; email: string; display_name: string | null; account_role: string; status: string; created_at: Date | string;
-      referral_code: string | null; commission_percent: number | null; affiliate_status: string | null; affiliate_type: string | null; website_url: string | null;
+      referral_code: string | null; commission_percent: number | null; commission_model: string | null; click_reward_paise: number | null; affiliate_status: string | null; affiliate_type: string | null; website_url: string | null;
     }>>(
       `SELECT u.id, u.email, u.display_name, u.account_role, u.status, u.created_at,
-        ap.referral_code, ap.commission_percent, ap.status AS affiliate_status, ap.affiliate_type, ap.website_url
+        ap.referral_code, ap.commission_percent, ap.commission_model, ap.click_reward_paise, ap.status AS affiliate_status, ap.affiliate_type, ap.website_url
        FROM users u LEFT JOIN affiliate_profiles ap ON ap.user_id = u.id
        WHERE u.account_role IN ('super_admin','subadmin','affiliate')
        ORDER BY FIELD(u.account_role, 'super_admin','subadmin','affiliate'), u.created_at DESC`,
@@ -44,11 +44,11 @@ export async function GET() {
     );
     const affiliateCountMap = new Map(affiliateCounts.map((row) => [row.affiliate_user_id, row]));
     const [currencyTotals] = await getPool().query<Array<RowDataPacket & { affiliate_user_id: string; currency: string; commission_paise: number; pending_paise: number }>>(
-      `SELECT ac.affiliate_user_id, p.currency,
+      `SELECT ac.affiliate_user_id, COALESCE(p.currency, 'INR') AS currency,
         SUM(CASE WHEN ac.status <> 'reversed' THEN ac.commission_paise ELSE 0 END) AS commission_paise,
         SUM(CASE WHEN ac.status IN ('pending','approved') THEN ac.commission_paise ELSE 0 END) AS pending_paise
-       FROM affiliate_commissions ac JOIN payments p ON p.id = ac.payment_record_id
-       GROUP BY ac.affiliate_user_id, p.currency`,
+       FROM affiliate_commissions ac LEFT JOIN payments p ON p.id = ac.payment_record_id
+       GROUP BY ac.affiliate_user_id, COALESCE(p.currency, 'INR')`,
     );
     const currencyTotalMap = new Map<string, Array<{ currency: string; commission: number; pending: number }>>();
     for (const row of currencyTotals) {
@@ -59,7 +59,8 @@ export async function GET() {
     return NextResponse.json({ staff: rows.map((row) => ({
       id: row.id, email: row.email, displayName: row.display_name || '', role: row.account_role, status: row.status, createdAt: row.created_at,
       permissions: permissionMap.get(row.id) || [], referralCode: row.referral_code, affiliateType: row.affiliate_type || 'admin_created', websiteUrl: row.website_url || '',
-      commissionPercent: row.commission_percent == null ? null : Number(row.commission_percent), affiliateStatus: row.affiliate_status,
+      commissionPercent: row.commission_percent == null ? null : Number(row.commission_percent),
+      commissionModel: row.commission_model || 'plan_purchase', clickReward: Number(row.click_reward_paise || 0) / 100, affiliateStatus: row.affiliate_status,
       referralCount: Number(affiliateCountMap.get(row.id)?.referrals || 0), paidReferralCount: Number(affiliateCountMap.get(row.id)?.paid_referrals || 0),
       commissionByCurrency: currencyTotalMap.get(row.id) || [],
     })), permissionCatalog: actor.isSuperAdmin ? permissionCatalog() : permissionCatalog().filter((item) => actor.permissions.includes(item.key)) });
@@ -87,10 +88,15 @@ export async function POST(request: NextRequest) {
     if (role === 'subadmin' && !actor.isSuperAdmin && requestedPermissions.some((p) => !(ADMIN_PERMISSIONS as readonly string[]).includes(p) || !actor.permissions.includes(p))) return NextResponse.json({ error: 'You can only grant permissions that you have been granted yourself.' }, { status: 403 });
     const permissionList = role === 'subadmin' ? requestedPermissions.filter((p) => (ADMIN_PERMISSIONS as readonly string[]).includes(p)) : [];
     const commissionPercent = Number(body.commissionPercent ?? 10);
+    const commissionModel = String(body.commissionModel || 'plan_purchase');
+    const clickRewardRupees = Number(body.clickRewardRupees ?? 0);
+    const clickRewardPaise = Math.round(clickRewardRupees * 100);
     const affiliateType = String(body.affiliateType || 'admin_created');
     const websiteUrlInput = String(body.websiteUrl || '').trim();
     const websiteUrl = websiteUrlInput ? validWebsiteUrl(websiteUrlInput) : null;
-    if (role === 'affiliate' && (!Number.isFinite(commissionPercent) || commissionPercent < 0 || commissionPercent > 100)) return NextResponse.json({ error: 'Commission must be between 0 and 100 percent.' }, { status: 400 });
+    if (role === 'affiliate' && (!Number.isFinite(commissionPercent) || commissionPercent < 0 || commissionPercent > 100)) return NextResponse.json({ error: 'Purchase commission must be between 0 and 100 percent.' }, { status: 400 });
+    if (role === 'affiliate' && !['plan_purchase', 'pay_per_click'].includes(commissionModel)) return NextResponse.json({ error: 'Choose Plan purchase or Pay per valid click.' }, { status: 400 });
+    if (role === 'affiliate' && (!Number.isFinite(clickRewardRupees) || clickRewardRupees < 0 || clickRewardRupees > 1000 || (commissionModel === 'pay_per_click' && clickRewardRupees <= 0))) return NextResponse.json({ error: 'Enter a click reward greater than ₹0 and no more than ₹1,000 per valid click.' }, { status: 400 });
     if (role === 'affiliate' && !['admin_created', 'external_website'].includes(affiliateType)) return NextResponse.json({ error: 'Choose a valid affiliate type.' }, { status: 400 });
     if (role === 'affiliate' && affiliateType === 'external_website' && !websiteUrl) return NextResponse.json({ error: 'External website affiliates must provide a valid public website URL.' }, { status: 400 });
     if (role === 'affiliate' && websiteUrlInput && !websiteUrl) return NextResponse.json({ error: 'Enter a valid website URL starting with https:// or http://.' }, { status: 400 });
@@ -132,7 +138,7 @@ export async function POST(request: NextRequest) {
     } else {
       const [affiliateRows] = await connection.execute<Array<RowDataPacket & { referral_code: string }>>('SELECT referral_code FROM affiliate_profiles WHERE user_id = ? LIMIT 1', [userId]);
       if (affiliateRows.length) {
-        await connection.execute('UPDATE affiliate_profiles SET commission_percent = ?, status = \'active\', affiliate_type = ?, website_url = ? WHERE user_id = ?', [commissionPercent, affiliateType, websiteUrl, userId]);
+        await connection.execute('UPDATE affiliate_profiles SET commission_percent = ?, commission_model = ?, click_reward_paise = ?, status = \'active\', affiliate_type = ?, website_url = ? WHERE user_id = ?', [commissionPercent, commissionModel, clickRewardPaise, affiliateType, websiteUrl, userId]);
       } else {
         let code = newReferralCode();
         for (let attempt = 0; attempt < 5; attempt++) {
@@ -140,7 +146,7 @@ export async function POST(request: NextRequest) {
           if (!taken.length) break;
           code = newReferralCode();
         }
-        await connection.execute('INSERT INTO affiliate_profiles (user_id, referral_code, commission_percent, payout_email, affiliate_type, website_url) VALUES (?, ?, ?, ?, ?, ?)', [userId, code, commissionPercent, email, affiliateType, websiteUrl]);
+        await connection.execute('INSERT INTO affiliate_profiles (user_id, referral_code, commission_percent, commission_model, click_reward_paise, payout_email, affiliate_type, website_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [userId, code, commissionPercent, commissionModel, clickRewardPaise, email, affiliateType, websiteUrl]);
       }
     }
     if (role === 'affiliate') {
@@ -148,7 +154,7 @@ export async function POST(request: NextRequest) {
       await connection.execute("UPDATE affiliate_applications SET status = 'approved', reviewed_by_admin_id = ?, reviewed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND status = 'pending'", [actor.id, userId]);
     }
     await connection.commit();
-    await logAdminAction(actor.id, 'staff.created_or_updated', 'user', userId, { email, role, permissions: role === 'subadmin' ? permissionList : [], isNewAccount, commissionPercent: role === 'affiliate' ? commissionPercent : undefined, affiliateType: role === 'affiliate' ? affiliateType : undefined, websiteUrl: role === 'affiliate' ? websiteUrl : undefined }, request);
+    await logAdminAction(actor.id, 'staff.created_or_updated', 'user', userId, { email, role, permissions: role === 'subadmin' ? permissionList : [], isNewAccount, commissionPercent: role === 'affiliate' ? commissionPercent : undefined, commissionModel: role === 'affiliate' ? commissionModel : undefined, clickRewardRupees: role === 'affiliate' ? clickRewardRupees : undefined, affiliateType: role === 'affiliate' ? affiliateType : undefined, websiteUrl: role === 'affiliate' ? websiteUrl : undefined }, request);
     return NextResponse.json({ success: true, userId, isNewAccount, message: isNewAccount ? 'Account prepared. The person can activate it with email OTP.' : 'Account role updated successfully.' }, { status: isNewAccount ? 201 : 200 });
   } catch (error: any) {
     if (connection) { try { await connection.rollback(); } catch { /* ignore rollback failure */ } }
@@ -187,18 +193,23 @@ export async function PATCH(request: NextRequest) {
     }
     if (users[0].account_role === 'affiliate') {
       if (!actor.isSuperAdmin && !hasPermission(actor, 'affiliates.manage')) return NextResponse.json({ error: 'Affiliate management permission required.' }, { status: 403 });
-      const [currentProfile] = await getPool().execute<Array<RowDataPacket & { affiliate_type: string; website_url: string | null }>>('SELECT affiliate_type, website_url FROM affiliate_profiles WHERE user_id = ? LIMIT 1', [userId]);
+      const [currentProfile] = await getPool().execute<Array<RowDataPacket & { affiliate_type: string; website_url: string | null; commission_model: string; click_reward_paise: number; commission_percent: number }>>('SELECT affiliate_type, website_url, commission_model, click_reward_paise, commission_percent FROM affiliate_profiles WHERE user_id = ? LIMIT 1', [userId]);
       const nextType = String(body.affiliateType ?? currentProfile[0]?.affiliate_type ?? 'admin_created');
       const nextWebsiteRaw = body.websiteUrl === undefined ? String(currentProfile[0]?.website_url || '') : String(body.websiteUrl || '').trim();
       const nextWebsite = nextWebsiteRaw ? validWebsiteUrl(nextWebsiteRaw) : null;
       if (!['admin_created','external_website'].includes(nextType)) return NextResponse.json({ error: 'Invalid affiliate type.' }, { status: 400 });
       if (nextWebsiteRaw && !nextWebsite) return NextResponse.json({ error: 'Enter a valid website URL starting with https:// or http://.' }, { status: 400 });
       if (nextType === 'external_website' && !nextWebsite) return NextResponse.json({ error: 'External website affiliates must have a valid website URL.' }, { status: 400 });
-      if (body.commissionPercent !== undefined) {
-        const rate = Number(body.commissionPercent);
-        if (!Number.isFinite(rate) || rate < 0 || rate > 100) return NextResponse.json({ error: 'Commission must be between 0 and 100 percent.' }, { status: 400 });
-        await getPool().execute('UPDATE affiliate_profiles SET commission_percent = ? WHERE user_id = ?', [rate, userId]);
-      }
+      const nextCommissionPercent = body.commissionPercent === undefined ? Number(currentProfile[0]?.commission_percent || 0) : Number(body.commissionPercent);
+      const nextCommissionModel = String(body.commissionModel ?? currentProfile[0]?.commission_model ?? 'plan_purchase');
+      const nextClickRewardRupees = body.clickRewardRupees === undefined ? Number(currentProfile[0]?.click_reward_paise || 0) / 100 : Number(body.clickRewardRupees);
+      if (!Number.isFinite(nextCommissionPercent) || nextCommissionPercent < 0 || nextCommissionPercent > 100) return NextResponse.json({ error: 'Purchase commission must be between 0 and 100 percent.' }, { status: 400 });
+      if (!['plan_purchase', 'pay_per_click'].includes(nextCommissionModel)) return NextResponse.json({ error: 'Choose Plan purchase or Pay per valid click.' }, { status: 400 });
+      if (!Number.isFinite(nextClickRewardRupees) || nextClickRewardRupees < 0 || nextClickRewardRupees > 1000 || (nextCommissionModel === 'pay_per_click' && nextClickRewardRupees <= 0)) return NextResponse.json({ error: 'Enter a click reward greater than ₹0 and no more than ₹1,000 per valid click.' }, { status: 400 });
+      await getPool().execute(
+        'UPDATE affiliate_profiles SET commission_percent = ?, commission_model = ?, click_reward_paise = ? WHERE user_id = ?',
+        [nextCommissionPercent, nextCommissionModel, Math.round(nextClickRewardRupees * 100), userId],
+      );
       if (body.affiliateStatus !== undefined) {
         if (!['active','paused'].includes(String(body.affiliateStatus))) return NextResponse.json({ error: 'Invalid affiliate status.' }, { status: 400 });
         await getPool().execute('UPDATE affiliate_profiles SET status = ? WHERE user_id = ?', [body.affiliateStatus, userId]);
@@ -215,7 +226,7 @@ export async function PATCH(request: NextRequest) {
         profileUpdates.push('website_url = ?'); profileValues.push(url);
       }
       if (profileUpdates.length) { profileValues.push(userId); await getPool().execute(`UPDATE affiliate_profiles SET ${profileUpdates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?`, profileValues); }
-      await logAdminAction(actor.id, 'affiliate.profile_updated', 'user', userId, { commissionPercent: body.commissionPercent, affiliateStatus: body.affiliateStatus, affiliateType: body.affiliateType, websiteUrl: body.websiteUrl }, request);
+      await logAdminAction(actor.id, 'affiliate.profile_updated', 'user', userId, { commissionPercent: body.commissionPercent, commissionModel: body.commissionModel, clickRewardRupees: body.clickRewardRupees, affiliateStatus: body.affiliateStatus, affiliateType: body.affiliateType, websiteUrl: body.websiteUrl }, request);
     }
     return NextResponse.json({ success: true });
   } catch (error) {

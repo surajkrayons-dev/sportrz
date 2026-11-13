@@ -1,12 +1,9 @@
 import type { PoolConnection, ResultSetHeader } from 'mysql2/promise';
 
 /**
- * Creates an affiliate commission and its optional external postback outbox row.
- *
- * Attribution is based on the immutable referral association and a captured
- * payment that happened after the referral was created. Unique keys make both
- * inserts safe to execute repeatedly from browser verification and Razorpay
- * webhook retries.
+ * Creates a revenue-share commission for a captured plan purchase and queues
+ * its optional S2S postback. CPC rewards are created atomically by the first-
+ * party click handler and must never be duplicated by payment webhooks.
  */
 export async function ensureAffiliateCommissionForPayment(
   connection: PoolConnection,
@@ -14,12 +11,13 @@ export async function ensureAffiliateCommissionForPayment(
 ): Promise<number> {
   const [result] = await connection.execute<ResultSetHeader>(
     `INSERT IGNORE INTO affiliate_commissions
-       (affiliate_user_id, referred_user_id, payment_record_id,
+       (affiliate_user_id, referred_user_id, payment_record_id, commission_model,
         amount_paise, commission_percent, commission_paise, status)
      SELECT
         ar.affiliate_user_id,
         ar.referred_user_id,
         p.id,
+        'plan_purchase',
         p.amount_paise,
         ap.commission_percent,
         FLOOR(p.amount_paise * ap.commission_percent / 100),
@@ -32,6 +30,7 @@ export async function ensureAffiliateCommissionForPayment(
      JOIN affiliate_profiles ap
        ON ap.user_id = ar.affiliate_user_id
       AND ap.status = 'active'
+      AND ap.commission_model = 'plan_purchase'
      JOIN users au
        ON au.id = ap.user_id
       AND au.account_role = 'affiliate'
@@ -43,8 +42,7 @@ export async function ensureAffiliateCommissionForPayment(
     [paymentRecordId],
   );
 
-  // Queue a postback only for external partners with a configured destination.
-  // The destination is snapshotted so later profile edits do not rewrite history.
+  // Only purchase commissions produce S2S conversion notifications.
   await connection.execute(
     `INSERT IGNORE INTO affiliate_postback_deliveries
        (affiliate_user_id, commission_id, destination_url, http_method, status)
@@ -53,10 +51,12 @@ export async function ensureAffiliateCommissionForPayment(
        JOIN affiliate_profiles ap ON ap.user_id = ac.affiliate_user_id
        JOIN users au ON au.id = ap.user_id
       WHERE ac.payment_record_id = ?
+        AND ac.commission_model = 'plan_purchase'
         AND ap.affiliate_type = 'external_website'
         AND ap.postback_url IS NOT NULL
         AND ap.postback_url <> ''
         AND ap.status = 'active'
+        AND ap.commission_model = 'plan_purchase'
         AND au.account_role = 'affiliate'
         AND au.status = 'active'`,
     [paymentRecordId],

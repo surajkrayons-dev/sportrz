@@ -103,11 +103,11 @@ export async function GET(
   const { code: rawCode } = await context.params;
   const referralCode = String(rawCode || '').trim().toUpperCase();
   const origin = appOrigin(request);
-  const loginUrl = new URL('/login', origin);
+  const homeUrl = new URL('/', origin);
 
   if (!/^[A-Z0-9-]{3,32}$/.test(referralCode)) {
-    loginUrl.searchParams.set('referral_error', 'invalid');
-    return NextResponse.redirect(loginUrl, 302);
+    homeUrl.searchParams.set('referral_error', 'invalid');
+    return NextResponse.redirect(homeUrl, 302);
   }
 
   let visitorToken = request.cookies.get(VISITOR_COOKIE)?.value || '';
@@ -139,8 +139,8 @@ export async function GET(
 
     const profile = profiles[0];
     if (!profile) {
-      loginUrl.searchParams.set('referral_error', 'inactive');
-      return NextResponse.redirect(loginUrl, 302);
+      homeUrl.searchParams.set('referral_error', 'inactive');
+      return NextResponse.redirect(homeUrl, 302);
     }
 
     const suppliedClickId = request.nextUrl.searchParams.get('click_id')?.trim() || '';
@@ -289,13 +289,7 @@ export async function GET(
       }
     }
 
-    loginUrl.searchParams.set('ref', profile.referral_code);
-    loginUrl.searchParams.set('click_id', clickId);
-
-    const requestedNext = request.nextUrl.searchParams.get('next') || '';
-    if (requestedNext.startsWith('/') && !requestedNext.startsWith('//')) loginUrl.searchParams.set('next', requestedNext);
-
-    const response = NextResponse.redirect(loginUrl, 302);
+    const response = NextResponse.redirect(homeUrl, 302);
     const options = cookieOptions();
     response.cookies.set('sportrz_affiliate_code', profile.referral_code, options);
     response.cookies.set('sportrz_affiliate_click', clickId, options);
@@ -307,9 +301,7 @@ export async function GET(
     // Keep the referral usable during a transient analytics failure. A first
     // party click record can still be attached at sign-in, but it is not paid.
     const fallbackClickId = `clk_${randomBytes(18).toString('hex')}`;
-    loginUrl.searchParams.set('ref', referralCode);
-    loginUrl.searchParams.set('click_id', fallbackClickId);
-    const response = NextResponse.redirect(loginUrl, 302);
+    const response = NextResponse.redirect(homeUrl, 302);
     const options = cookieOptions();
     response.cookies.set('sportrz_affiliate_code', referralCode, options);
     response.cookies.set('sportrz_affiliate_click', fallbackClickId, options);
